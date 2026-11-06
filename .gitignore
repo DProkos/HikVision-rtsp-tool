@@ -16,3 +16,4 @@ discover_debug.txt
 packaging/dist/
 packaging/build_tmp/
 packaging/*.spec
+https_check.txt

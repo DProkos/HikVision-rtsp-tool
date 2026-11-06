@@ -185,7 +185,9 @@ def make_http_opener(cfg):
 
 import hashlib        # noqa: E402
 import http.client    # noqa: E402
+import socket         # noqa: E402
 import ssl            # noqa: E402
+import warnings       # noqa: E402
 from urllib.parse import urlsplit  # noqa: E402
 
 # Πιστοποιητικά HTTPS που έχουμε «μάθει» ("ip:θύρα" -> αποτύπωμα sha256). Τα καταγραφικά
@@ -202,15 +204,40 @@ def _tls_context():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE                 # ο έλεγχος γίνεται με το αποτύπωμα (pin)
-    try:
-        ctx.minimum_version = ssl.TLSVersion.TLSv1   # παλιά firmware δεν έχουν TLS 1.2
-    except (AttributeError, ValueError):
-        pass
-    try:
-        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")       # παλιά πιστοποιητικά (RSA 1024, SHA1)
-    except ssl.SSLError:
-        pass
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)   # «TLSv1 is deprecated»
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1       # παλιά firmware δεν έχουν TLS 1.2
+        except (AttributeError, ValueError):
+            pass
+    for ciphers in ("ALL:@SECLEVEL=0", "DEFAULT:@SECLEVEL=0"):   # παλιά κρυπτοσυστήματα/πιστοποιητικά
+        try:
+            ctx.set_ciphers(ciphers)
+            break
+        except ssl.SSLError:
+            continue
     return ctx
+
+
+def describe_net_error(e, https, port):
+    """Σύντομο, κατανοητό μήνυμα για σφάλμα δικτύου."""
+    proto = "HTTPS" if https else "HTTP"
+    kind = type(e).__name__
+    if isinstance(e, ConnectionRefusedError):
+        msg = f"Η θύρα {port} είναι κλειστή (είναι ενεργό το {proto} στο καταγραφικό;)"
+    elif isinstance(e, (socket.timeout, TimeoutError)):
+        msg = f"Δεν απαντά στη θύρα {port} (timeout) - έλεγξε IP/θύρα/δίκτυο"
+    elif isinstance(e, socket.gaierror):
+        msg = "Λάθος διεύθυνση IP"
+    elif isinstance(e, ssl.SSLError):
+        msg = "Αποτυχία TLS (παλιό πρωτόκολλο/κρυπτοσύστημα στο καταγραφικό;)"
+    elif isinstance(e, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                        http.client.RemoteDisconnected)):
+        msg = (f"Το καταγραφικό έκλεισε τη σύνδεση στη θύρα {port}"
+               + (" κατά το handshake TLS" if https else ""))
+    else:
+        msg = "Σφάλμα σύνδεσης"
+    return f"{msg} [{kind}]"
 
 
 class FastHttpClient:
@@ -420,9 +447,15 @@ def discover_cameras(cfg):
     ip_streams = sorted(c for c in stream_channels if c > analog_count)
     ids = sorted(proxies)
     for k, cid in enumerate(ids):
-        ch = ip_streams[k] if len(ip_streams) == len(ids) else analog_count + cid
+        # Το id μπορεί να είναι σχετικό (4 -> κανάλι 16+4) ή ήδη απόλυτο (20 = κανάλι 20).
+        absolute = cid > analog_count
+        rel = cid - analog_count if absolute else cid
+        if len(ip_streams) == len(ids):
+            ch = ip_streams[k]
+        else:
+            ch = cid if absolute else analog_count + cid
         name, ipaddr = proxies[cid]
-        cams.append({"id": f"D{cid}", "name": name or f"IPCamera {cid:02d}",
+        cams.append({"id": f"D{rel}", "name": name or f"IPCamera {rel:02d}",
                      "channel": ch, "kind": "ip", "ip": ipaddr,
                      "online": online.get(cid)})
     res = {"cameras": cams, "analog_count": analog_count, "log": log, "raw": raw}
@@ -460,6 +493,8 @@ class HttpSnapshotWorker(QThread):
         self.pic_url = snapshot_url(cfg, cam_id)
         self.mjpeg_urls = mjpeg_urls(cfg, cam_id)
         self.opener = make_http_opener(cfg)
+        self.https = bool(cfg.get("https"))
+        self.port = cfg.get("http_port", 80)
         self.user, self.password = cfg["user"], cfg["password"]
         self.interval = 1.0 / max(0.2, fps)
         self.want_mjpeg = want_mjpeg
@@ -596,7 +631,7 @@ class HttpSnapshotWorker(QThread):
                 elif "404" in msg:
                     self.status = "Η κάμερα δεν δίνει στιγμιότυπο"
                 else:
-                    self.status = "Σφάλμα σύνδεσης"
+                    self.status = describe_net_error(e, self.https, self.port)
             wait = max(per_conn_interval, 2.0) if fails else per_conn_interval
             end = time.time() + max(0.0, wait - (time.time() - t0))
             while self._run and time.time() < end:
