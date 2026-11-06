@@ -12,11 +12,13 @@ keep-alive, και ελέγχει σωστά το digest response.
             αρκετά για μέτρηση fps, όχι για προβολή)
   --mjpeg   ενεργοποιεί το /httpPreview (ροή multipart)
   --delay   χρόνος «δημιουργίας» κάθε εικόνας σε δευτερόλεπτα
+  --serial  ένα αίτημα τη φορά (μιμείται DVR που δεν δουλεύει παράλληλα)
 Χρήστης/κωδικός: admin / test
 """
 import argparse
 import hashlib
 import re
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -28,7 +30,9 @@ def md5(s):
     return hashlib.md5(s.encode()).hexdigest()
 
 
-def make_handler(jpeg, delay, mjpeg):
+def make_handler(jpeg, delay, mjpeg, serial=False):
+    lock = threading.Lock()                    # --serial: ένα αίτημα τη φορά
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"          # keep-alive, όπως τα πραγματικά DVR
 
@@ -65,14 +69,19 @@ def make_handler(jpeg, delay, mjpeg):
             STATS["requests"] += 1
             if not self._authorized():
                 return
-            if self.path.endswith("/picture"):
-                time.sleep(delay)
+            path = self.path.split("?")[0]
+            if path.endswith("/picture"):
+                if serial:
+                    with lock:
+                        time.sleep(delay)
+                else:
+                    time.sleep(delay)
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(jpeg)))
                 self.end_headers()
                 self.wfile.write(jpeg)
-            elif self.path.endswith("/httpPreview") and mjpeg:
+            elif path.endswith("/httpPreview") and mjpeg:
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.end_headers()
@@ -97,9 +106,11 @@ def main():
     ap.add_argument("--jpeg")
     ap.add_argument("--mjpeg", action="store_true")
     ap.add_argument("--delay", type=float, default=0.02)
+    ap.add_argument("--serial", action="store_true",
+                    help="εξυπηρέτηση ενός αιτήματος τη φορά (όπως αργό DVR)")
     a = ap.parse_args()
     jpeg = open(a.jpeg, "rb").read() if a.jpeg else b"\xff\xd8" + b"\x00" * 20000 + b"\xff\xd9"
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(jpeg, a.delay, a.mjpeg))
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(jpeg, a.delay, a.mjpeg, a.serial))
     print(f"mock DVR στο http://127.0.0.1:{a.port}  (admin/test)  Ctrl+C για τέλος")
     try:
         srv.serve_forever()

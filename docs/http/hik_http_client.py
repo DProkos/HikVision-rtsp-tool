@@ -244,6 +244,78 @@ class HikHttpCamera:
             client.close()
 
 
+def bench_url(url, user, password, seconds=4.0, parallel=1):
+    """Μετρά τον ρυθμό ενός URL με `parallel` μόνιμες συνδέσεις ταυτόχρονα
+    (όλες στην ίδια κάμερα). Επιστρέφει (fps συνολικά, διάμεσος ms, σφάλμα|None)."""
+    import threading
+    lock = threading.Lock()
+    lat, err = [], []
+    stop = time.time() + seconds
+
+    def worker(offset):
+        c = DigestKeepAliveClient(url, user, password)
+        time.sleep(offset)                       # μικρή μετατόπιση ανάμεσα στις συνδέσεις
+        try:
+            while time.time() < stop:
+                s = time.time()
+                d = c.get()
+                dt = time.time() - s
+                if d[:2] == b"\xff\xd8":
+                    with lock:
+                        lat.append(dt)
+        except Exception as e:
+            err.append(str(e)[:40])
+        finally:
+            c.close()
+
+    ths = [threading.Thread(target=worker, args=(i * 0.05,)) for i in range(parallel)]
+    t0 = time.time()
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    dur = time.time() - t0
+    if not lat:
+        return 0.0, 0.0, (err[0] if err else "καμία εικόνα")
+    lat.sort()
+    return len(lat) / dur, lat[len(lat) // 2] * 1000, (err[0] if err else None)
+
+
+def sweep(ip, port, user, password, channel, seconds=4.0):
+    base = f"http://{ip}:{port}"
+    ch = channel
+    cands = [
+        ("κύρια ροή  (101/picture)", f"{base}/ISAPI/Streaming/channels/{ch}01/picture"),
+        ("sub ροή    (102/picture)", f"{base}/ISAPI/Streaming/channels/{ch}02/picture"),
+        ("κύρια 352x288", f"{base}/ISAPI/Streaming/channels/{ch}01/picture"
+                          f"?videoResolutionWidth=352&videoResolutionHeight=288"),
+        ("κύρια 176x144", f"{base}/ISAPI/Streaming/channels/{ch}01/picture"
+                          f"?videoResolutionWidth=176&videoResolutionHeight=144"),
+        ("χωρίς ISAPI (/Streaming/..)", f"{base}/Streaming/channels/{ch}01/picture"),
+    ]
+    print(f"Δοκιμή εναλλακτικών δρόμων εικόνας, κανάλι {ch}, {seconds:.0f}s ο καθένας")
+    print(f"{'δρόμος':30} {'fps':>6} {'ms/καρέ':>8}  σχόλιο")
+    best = None
+    for name, url in cands:
+        fps, med, err = bench_url(url, user, password, seconds)
+        note = err or ""
+        print(f"{name:30} {fps:6.1f} {med:8.0f}  {note}")
+        if fps > 0 and (best is None or fps > best[0]):
+            best = (fps, name, url)
+    if not best:
+        print("Κανένας δρόμος δεν έδωσε εικόνα.")
+        return
+    print(f"\nΚαλύτερος: {best[1]} ({best[0]:.1f} fps). "
+          f"Δοκιμή με πολλές παράλληλες συνδέσεις στην ίδια κάμερα:")
+    print(f"{'συνδέσεις':>10} {'fps συνολικά':>13} {'ms/καρέ':>8}")
+    for n in (1, 2, 3, 4, 6):
+        fps, med, err = bench_url(best[2], user, password, seconds, parallel=n)
+        print(f"{n:10d} {fps:13.1f} {med:8.0f}  {err or ''}")
+    print("\nΑν τα fps ανεβαίνουν με περισσότερες συνδέσεις, το καταγραφικό τις εξυπηρετεί"
+          "\nπαράλληλα και μπορούμε να πάρουμε περισσότερα καρέ από την ίδια κάμερα."
+          "\nΑν μένουν σταθερά, εξυπηρετεί μία-μία και αυτό είναι το όριο της συσκευής.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Μέτρηση fps εικόνας HTTP από καταγραφικό Hikvision")
     ap.add_argument("--ip", required=True)
@@ -254,6 +326,8 @@ def main():
     ap.add_argument("--fps", type=float, default=15)
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--no-mjpeg", action="store_true", help="μόνο polling στιγμιοτύπων")
+    ap.add_argument("--sweep", action="store_true",
+                    help="δοκιμή εναλλακτικών δρόμων εικόνας + παράλληλων συνδέσεων")
     ap.add_argument("--bench", action="store_true",
                     help="μέτρηση ταβανιού polling: καρέ όσο πιο γρήγορα γίνεται")
     ap.add_argument("--probe", action="store_true",
@@ -262,6 +336,9 @@ def main():
     a = ap.parse_args()
 
     cam = HikHttpCamera(a.ip, a.user, a.password, a.channel, a.port)
+    if a.sweep:
+        sweep(a.ip, a.port, a.user, a.password, a.channel)
+        return
     if a.bench:
         # μέτρηση ταβανιού polling: ζήτα καρέ όσο πιο γρήγορα γίνεται (χωρίς παύση)
         client = DigestKeepAliveClient(cam.picture_url(), a.user, a.password)
