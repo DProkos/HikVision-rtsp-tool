@@ -14,6 +14,7 @@ RTSP URL Hikvision:
             (προαιρετικά opencv-python ως εναλλακτικό, αν δεν υπάρχει το av)
 """
 import json
+import re
 import os
 import sys
 import time
@@ -138,6 +139,88 @@ def make_http_opener(cfg):
     )
 
 
+import hashlib        # noqa: E402
+import http.client    # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
+
+
+class FastHttpClient:
+    """Γρήγορος πελάτης HTTP με ΜΟΝΙΜΗ σύνδεση (keep-alive) και χειροκίνητο
+    digest. Αποφεύγει το κόστος «νέα σύνδεση + login» σε κάθε καρέ, ώστε να
+    πιάνουμε πολύ μεγαλύτερο ρυθμό από το απλό urllib."""
+
+    def __init__(self, url, user, password, timeout=5):
+        p = urlsplit(url)
+        self.host, self.port = p.hostname, p.port or 80
+        self.path = p.path + (("?" + p.query) if p.query else "")
+        self.user, self.password, self.timeout = user, password, timeout
+        self.conn = None
+        self.ch = None                     # αποθηκευμένο digest challenge
+        self.nc = 0
+        self.cnonce = hashlib.md5(os.urandom(8)).hexdigest()[:16]
+
+    def _connect(self):
+        self.close()
+        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+    @staticmethod
+    def _h(s):
+        return hashlib.md5(s.encode()).hexdigest()
+
+    def _auth_header(self):
+        c = self.ch
+        self.nc += 1
+        ha1 = self._h(f"{self.user}:{c['realm']}:{self.password}")
+        ha2 = self._h(f"GET:{self.path}")
+        nc = f"{self.nc:08x}"
+        if c.get("qop"):
+            resp = self._h(f"{ha1}:{c['nonce']}:{nc}:{self.cnonce}:auth:{ha2}")
+        else:
+            resp = self._h(f"{ha1}:{c['nonce']}:{ha2}")
+        a = (f'Digest username="{self.user}", realm="{c["realm"]}", nonce="{c["nonce"]}", '
+             f'uri="{self.path}", response="{resp}"')
+        if c.get("qop"):
+            a += f', qop=auth, nc={nc}, cnonce="{self.cnonce}"'
+        if c.get("opaque"):
+            a += f', opaque="{c["opaque"]}"'
+        return a
+
+    def _request(self):
+        headers = {"Connection": "keep-alive"}
+        if self.ch:
+            headers["Authorization"] = self._auth_header()
+        self.conn.request("GET", self.path, headers=headers)
+        r = self.conn.getresponse()
+        body = r.read()
+        return r, body
+
+    def get(self):
+        """Επιστρέφει bytes (JPEG) ή σηκώνει εξαίρεση."""
+        if self.conn is None:
+            self._connect()
+        try:
+            r, body = self._request()
+        except Exception:
+            self._connect()                # ξαναστήσε τη σύνδεση και ξαναδοκίμασε
+            r, body = self._request()
+        if r.status == 401:                # πρώτη φορά ή παλιό nonce: πάρε challenge
+            www = r.getheader("WWW-Authenticate", "")
+            self.ch = {k: (v1 or v2) for k, v1, v2 in
+                       re.findall(r'(\w+)=(?:"([^"]+)"|([^,\s]+))', www)}
+            r, body = self._request()
+        if r.status != 200:
+            raise OSError(f"HTTP {r.status}")
+        return body
+
+
 # --------------------------------------------------------------------------- #
 class HttpSnapshotWorker(QThread):
     """Ζωντανή εικόνα χωρίς RTSP, μέσω του δρόμου HTTP που ΔΕΝ κρυπτογραφείται.
@@ -149,6 +232,7 @@ class HttpSnapshotWorker(QThread):
         self.pic_url = snapshot_url(cfg, cam_id)
         self.mjpeg_urls = mjpeg_urls(cfg, cam_id)
         self.opener = make_http_opener(cfg)
+        self.user, self.password = cfg["user"], cfg["password"]
         self.interval = 1.0 / max(0.2, fps)
         self.want_mjpeg = want_mjpeg
         self._run = True
@@ -173,7 +257,14 @@ class HttpSnapshotWorker(QThread):
             self.latest = img.convertToFormat(QImage.Format_RGB888)
             self.seq += 1
             self.status = ""
-            self.info = f"{tag} {img.width()}x{img.height()}"
+            now = time.time()
+            if not hasattr(self, "_fps_t"):
+                self._fps_t, self._fps_n, self.real_fps = now, self.seq, 0.0
+            elif now - self._fps_t >= 2:
+                self.real_fps = (self.seq - self._fps_n) / (now - self._fps_t)
+                self._fps_t, self._fps_n = now, self.seq
+            fps_txt = f"  {self.real_fps:.0f} fps" if self.real_fps else ""
+            self.info = f"{tag} {img.width()}x{img.height()}{fps_txt}"
             return True
         return False
 
@@ -227,12 +318,11 @@ class HttpSnapshotWorker(QThread):
 
     def _run_polling(self):
         fails = 0
+        client = FastHttpClient(self.pic_url, self.user, self.password)
         while self._run:
             t0 = time.time()
             try:
-                self._reset_auth()
-                with self.opener.open(self.pic_url, timeout=8) as r:
-                    data = r.read()
+                data = client.get()
                 if self._emit_jpeg(data, "JPEG"):
                     fails = 0
                 else:
@@ -250,7 +340,8 @@ class HttpSnapshotWorker(QThread):
             wait = max(self.interval, 2.0) if fails else self.interval
             end = time.time() + max(0.0, wait - (time.time() - t0))
             while self._run and time.time() < end:
-                time.sleep(0.03)
+                time.sleep(0.005)
+        client.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -522,7 +613,7 @@ class MainWindow(QMainWindow):
         self.sp_http = QSpinBox(); self.sp_http.setRange(1, 65535)
         self.sp_http.setValue(self.cfg.get("http_port", 80))
         self.sp_http.setToolTip("Θύρα web (HTTP) του καταγραφικού - για τα Στιγμιότυπα HTTP.")
-        self.sp_fps = QSpinBox(); self.sp_fps.setRange(1, 15)
+        self.sp_fps = QSpinBox(); self.sp_fps.setRange(1, 30)
         self.sp_fps.setValue(self.cfg.get("fps", 2))
         self.sp_fps.setToolTip("Ρυθμός καρέ για τη λειτουργία Στιγμιότυπα HTTP.\n"
                                "Μεγαλύτερος = πιο real-time, αλλά φορτώνει το καταγραφικό.")
@@ -722,8 +813,8 @@ class MainWindow(QMainWindow):
         # Στη μονή προβολή: στιγμιότυπα αν είναι σε αυτή τη λειτουργία,
         # αλλιώς κύρια ροή (καλύτερη ποιότητα)
         single = "snapshot" if cfg["stream"] == "snapshot" else "main"
-        # στη μονή προβολή πιο γρήγορα (τουλάχιστον 4 fps)
-        fps = max(4, cfg.get("fps", 2)) if single == "snapshot" else None
+        # στη μονή προβολή όσο πιο γρήγορα αντέχει το καταγραφικό (στόχος 25 fps)
+        fps = max(25, cfg.get("fps", 2)) if single == "snapshot" else None
         w = self.make_worker(cfg, cam[0], single, fps=fps)
         self.tiles[0].play(cam, w)
         self.running = True
