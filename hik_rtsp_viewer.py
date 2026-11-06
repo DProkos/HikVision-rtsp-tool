@@ -45,12 +45,12 @@ except ImportError:
 if av is None and cv2 is None:
     sys.exit("Λείπει βιβλιοθήκη βίντεο:  pip install av")
 
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal  # noqa: E402
-from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor  # noqa: E402
+from PyQt5.QtCore import Qt, QEvent, QPoint, QRect, QSize, QThread, QTimer, pyqtSignal  # noqa: E402
+from PyQt5.QtGui import QImage, QPixmap, QFont, QFontMetrics, QPainter, QColor, QKeySequence  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QComboBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget, QSizePolicy,
+    QSpinBox, QSplitter, QVBoxLayout, QWidget, QSizePolicy, QShortcut, QLayout,
 )
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -655,6 +655,70 @@ class StreamWorker(QThread):
             time.sleep(0.1)
 
 
+class FlowLayout(QLayout):
+    """Διάταξη που ΣΠΑΕΙ σε πολλές γραμμές όταν δεν χωράνε τα στοιχεία (σαν κείμενο)."""
+
+    def __init__(self, parent=None, hspacing=8, vspacing=4):
+        super().__init__(parent)
+        self._items = []
+        self._h, self._v = hspacing, vspacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._layout(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            if not it.isEmpty():
+                size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _layout(self, rect, test_only):
+        m = self.contentsMargins()
+        r = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = r.x(), r.y(), 0
+        for it in self._items:
+            if it.isEmpty():                      # κρυμμένο widget
+                continue
+            hint = it.sizeHint()
+            if x + hint.width() > r.right() + 1 and line_h > 0:
+                x = r.x()
+                y += line_h + self._v
+                line_h = 0
+            if not test_only:
+                it.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._h
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
 # --------------------------------------------------------------------------- #
 class VideoTile(QLabel):
     doubleClicked = pyqtSignal(object)
@@ -732,13 +796,16 @@ class VideoTile(QLabel):
         if self.last_image is None:
             return
         pm = QPixmap.fromImage(self.last_image)
-        if pm.width() > self.width() or pm.height() > self.height():
-            pm = pm.scaled(self.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
+        avail = self.size() - QSize(4, 4)                  # μικρό περιθώριο για το πλαίσιο
+        if avail.width() > 8 and avail.height() > 8 and pm.size() != avail:
+            # γεμίζει το κελί διατηρώντας τις αναλογίες (και μεγαλώνει, π.χ. σε full screen)
+            upscale = pm.width() < avail.width() and pm.height() < avail.height()
+            pm = pm.scaled(avail, Qt.KeepAspectRatio,
+                           Qt.SmoothTransformation if upscale else Qt.FastTransformation)
         p = QPainter(pm)
-        p.fillRect(0, 0, pm.width(), 20, QColor(0, 0, 0, 140))
-        p.setPen(QColor("white"))
-        p.setFont(QFont("Arial", 9, QFont.Bold))
+        fs = max(9, min(28, pm.height() // 34))             # μέγεθος γραμμάτων ~ μέγεθος κελιού
         txt = self.caption()
+        p.setPen(QColor("white"))
         w = self.worker
         if w and w.info:
             txt += f"   {w.info}"
@@ -747,7 +814,16 @@ class VideoTile(QLabel):
             p.setPen(QColor("#ff6b6b") if w.loss > 5 else QColor("white"))
         if self._status:
             txt += f"  [{self._status}]"
-        p.drawText(6, 15, txt)
+        # μίκρυνε τα γράμματα μέχρι να χωρέσει όλο το κείμενο στο πλάτος της εικόνας
+        font = QFont("Arial", fs, QFont.Bold)
+        while fs > 7 and QFontMetrics(font).horizontalAdvance(txt) > pm.width() - 12:
+            fs -= 1
+            font = QFont("Arial", fs, QFont.Bold)
+        txt = QFontMetrics(font).elidedText(txt, Qt.ElideRight, pm.width() - 12)   # «…» αν δεν χωράει
+        bar_h = int(fs * 2.1)
+        p.fillRect(0, 0, pm.width(), bar_h, QColor(0, 0, 0, 140))
+        p.setFont(font)
+        p.drawText(6, int(bar_h * 0.72), txt)
         p.end()
         self.setPixmap(pm)
 
@@ -826,22 +902,29 @@ class MainWindow(QMainWindow):
         btn_next = QPushButton("▶"); btn_next.clicked.connect(lambda: self.change_page(1))
         btn_snap = QPushButton("📷 Στιγμιότυπο"); btn_snap.clicked.connect(self.snapshot)
         btn_url = QPushButton("URL"); btn_url.clicked.connect(self.show_url)
+        btn_full = QPushButton("⛶ Πλήρης οθόνη"); btn_full.clicked.connect(self.toggle_fullscreen)
+        btn_full.setToolTip("F11: το πρόγραμμα γεμίζει όλη την οθόνη (μένουν όλα τα στοιχεία).\n"
+                            "Esc ή F11: έξοδος.  PageUp / PageDown: προηγούμενη / επόμενη κάμερα ή σελίδα.")
+        btn_clean = QPushButton("▣ Μόνο εικόνα"); btn_clean.clicked.connect(self.toggle_clean)
+        btn_clean.setToolTip("F10: κρύβει μπάρα, λίστα και μπάρα κατάστασης, μένουν μόνο οι κάμερες.\n"
+                             "Ξανά F10 ή Esc για επιστροφή.")
         self.lbl_page = QLabel()
         btn_connect.setStyleSheet("background:#d32f2f;color:white;font-weight:bold;padding:4px 12px;")
+        self.btn_connect = btn_connect
 
-        top = QHBoxLayout()
-        self._field_labels = {}              # ώστε να κρύβουμε πεδίο ΜΑΖΙ με την ετικέτα του
+        top = FlowLayout()
+        self._field_boxes = {}               # πεδίο -> κουτί (ετικέτα+πεδίο) για απόκρυψη/εμφάνιση
         for lbl, w in [("IP:", self.ed_ip), ("RTSP:", self.sp_port), ("Χρήστης:", self.ed_user),
                        ("Κωδικός:", self.ed_pass), ("Ροή:", self.cb_stream),
                        ("HTTP:", self.sp_http), ("fps:", self.sp_fps),
                        ("συνδ.:", self.sp_conns), ("Ανάλ.:", self.cb_res),
                        ("Πλέγμα:", self.cb_layout), ("IP βάση:", self.sp_ipbase)]:
-            lab = QLabel(lbl)
-            self._field_labels[w] = lab
-            top.addWidget(lab); top.addWidget(w)
-        top.addWidget(btn_connect); top.addWidget(btn_stop)
-        top.addStretch()
-        for w in (btn_prev, self.lbl_page, btn_next, btn_snap, btn_url):
+            box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0); hb.setSpacing(3)
+            hb.addWidget(QLabel(lbl)); hb.addWidget(w)
+            self._field_boxes[w] = box
+            top.addWidget(box)
+        for w in (btn_connect, btn_stop, btn_prev, self.lbl_page, btn_next, btn_snap,
+                  btn_full, btn_clean, btn_url):
             top.addWidget(w)
 
         # ---------- λίστα καμερών
@@ -879,8 +962,24 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         central = QWidget(); v = QVBoxLayout(central)
-        v.addLayout(top); v.addWidget(splitter, 1)
+        self.top_bar = QWidget(); self.top_bar.setLayout(top)
+        top.setContentsMargins(0, 0, 0, 0)
+        self.left_panel = left
+        v.addWidget(self.top_bar); v.addWidget(splitter, 1)
         self.setCentralWidget(central)
+        self._fs_saved = None
+        self._clean = False
+        self._scale = 1.0
+        self._base_pt = QApplication.font().pointSizeF()
+        if self._base_pt <= 0:
+            self._base_pt = 9.0
+        self._scale_timer = QTimer(self); self._scale_timer.setSingleShot(True)
+        self._scale_timer.timeout.connect(self.apply_scale)
+        QShortcut(QKeySequence("F10"), self, activated=self.toggle_clean)
+        QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
+        QShortcut(QKeySequence("Esc"), self, activated=self.exit_fullscreen)
+        QShortcut(QKeySequence("PgDown"), self, activated=lambda: self.change_page(1))
+        QShortcut(QKeySequence("PgUp"), self, activated=lambda: self.change_page(-1))
         self.statusBar().showMessage("Συμπλήρωσε IP/κωδικό του καταγραφικού και πάτα Προβολή. "
                                      "Διπλό κλικ σε κελί = μεγέθυνση / επιστροφή.")
 
@@ -953,6 +1052,57 @@ class MainWindow(QMainWindow):
         if self.running:
             self.play_page()
         self.update_page_label()
+
+    def toggle_fullscreen(self):
+        """F11: το παράθυρο γεμίζει την οθόνη. Όλα τα στοιχεία μένουν και προσαρμόζονται."""
+        if self.isFullScreen():
+            self.exit_fullscreen()
+        else:
+            self._fs_saved = {"max": self.isMaximized(), "geo": self.geometry()}
+            self.showFullScreen()
+
+    def exit_fullscreen(self):
+        """Esc: πρώτα βγαίνει από το «Μόνο εικόνα», μετά από το full screen."""
+        if self._clean:
+            self.toggle_clean()
+            return
+        if self.isFullScreen():
+            if self._fs_saved and self._fs_saved["max"]:
+                self.showMaximized()
+            else:
+                self.showNormal()
+                if self._fs_saved:
+                    self.setGeometry(self._fs_saved["geo"])
+
+    def toggle_clean(self):
+        """F10: μόνο οι κάμερες (κρύβει μπάρα, λίστα, μπάρα κατάστασης)."""
+        self._clean = not self._clean
+        for wdg in (self.top_bar, self.left_panel):
+            wdg.setVisible(not self._clean)
+        self.statusBar().setVisible(not self._clean)
+        m = 0 if self._clean else 9
+        self.centralWidget().layout().setContentsMargins(m, m, m, m)
+        self.grid.setSpacing(1 if self._clean else 2)
+
+    # ---- κλιμάκωση του περιβάλλοντος με το μέγεθος του παραθύρου
+    def apply_scale(self):
+        scale = max(1.0, min(2.2, self.width() / 1500.0))
+        if abs(scale - self._scale) < 0.06:
+            return
+        self._scale = scale
+        f = QApplication.font()
+        f.setPointSizeF(self._base_pt * scale)
+        QApplication.setFont(f)
+        # τα widgets με stylesheet δεν παίρνουν μόνα τους τη νέα γραμματοσειρά
+        self.btn_connect.setFont(f)
+        self.btn_connect.setStyleSheet(self.btn_connect.styleSheet())
+        self.cam_list.setMaximumWidth(int(250 * scale))
+        for t in self.tiles:
+            t._render()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._scale_timer.start(120)            # μετά το τέλος του resize, όχι σε κάθε pixel
 
     def populate_camera_list(self):
         self.cam_list.clear()
@@ -1073,10 +1223,9 @@ class MainWindow(QMainWindow):
         http = self.cb_stream.currentIndex() == 2
         http_only = (self.sp_http, self.sp_fps, self.sp_conns, self.cb_res)
         for w in http_only:
-            w.setVisible(http)
-            self._field_labels[w].setVisible(http)
-        self.sp_port.setVisible(not http)
-        self._field_labels[self.sp_port].setVisible(not http)
+            self._field_boxes[w].setVisible(http)
+        self._field_boxes[self.sp_port].setVisible(not http)
+        self.top_bar.updateGeometry()
         self.statusBar().showMessage(
             "Λειτουργία Στιγμιότυπα HTTP: εικόνα μέσω θύρας web (δουλεύει και με κρυπτογράφηση)."
             if http else
