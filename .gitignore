@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# τοπικά αρχεία με κωδικούς / στοιχεία συσκευής
+hik_viewer_config.json
+isapi_backup.xml
+ezviz_backup.xml
+diag_report.txt
+diag_snapshots/
+snapshots/
