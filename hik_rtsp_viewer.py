@@ -684,12 +684,15 @@ class MainWindow(QMainWindow):
         btn_connect.setStyleSheet("background:#d32f2f;color:white;font-weight:bold;padding:4px 12px;")
 
         top = QHBoxLayout()
-        for lbl, w in [("IP:", self.ed_ip), ("Θύρα:", self.sp_port), ("Χρήστης:", self.ed_user),
+        self._field_labels = {}              # ώστε να κρύβουμε πεδίο ΜΑΖΙ με την ετικέτα του
+        for lbl, w in [("IP:", self.ed_ip), ("RTSP:", self.sp_port), ("Χρήστης:", self.ed_user),
                        ("Κωδικός:", self.ed_pass), ("Ροή:", self.cb_stream),
                        ("HTTP:", self.sp_http), ("fps:", self.sp_fps),
                        ("συνδ.:", self.sp_conns), ("Ανάλ.:", self.cb_res),
                        ("Πλέγμα:", self.cb_layout), ("IP βάση:", self.sp_ipbase)]:
-            top.addWidget(QLabel(lbl)); top.addWidget(w)
+            lab = QLabel(lbl)
+            self._field_labels[w] = lab
+            top.addWidget(lab); top.addWidget(w)
         top.addWidget(btn_connect); top.addWidget(btn_stop)
         top.addStretch()
         for w in (btn_prev, self.lbl_page, btn_next, btn_snap, btn_url):
@@ -726,6 +729,8 @@ class MainWindow(QMainWindow):
 
         self.cb_layout.currentTextChanged.connect(lambda _: self.relayout(reset_page=True))
         self.cb_stream.currentIndexChanged.connect(lambda _: self.restart_if_running())
+        self.cb_stream.currentIndexChanged.connect(lambda _: self.apply_mode_fields())
+        self.apply_mode_fields()
         self.running = False
         self.build_tiles(self.layout_n())
 
@@ -791,6 +796,22 @@ class MainWindow(QMainWindow):
         if self.running:
             self.play_page()
         self.update_page_label()
+
+    def apply_mode_fields(self):
+        """Δείχνει μόνο τα πεδία που αφορούν την επιλεγμένη ροή:
+        RTSP (sub/main): θύρα RTSP.  Στιγμιότυπα HTTP: θύρα HTTP, fps, συνδ., ανάλυση."""
+        http = self.cb_stream.currentIndex() == 2
+        http_only = (self.sp_http, self.sp_fps, self.sp_conns, self.cb_res)
+        for w in http_only:
+            w.setVisible(http)
+            self._field_labels[w].setVisible(http)
+        self.sp_port.setVisible(not http)
+        self._field_labels[self.sp_port].setVisible(not http)
+        self.statusBar().showMessage(
+            "Λειτουργία Στιγμιότυπα HTTP: εικόνα μέσω θύρας web (δουλεύει και με κρυπτογράφηση)."
+            if http else
+            "Λειτουργία RTSP: κανονικό βίντεο· αν η εικόνα είναι πράσινη/χαλασμένη, η ροή "
+            "είναι κρυπτογραφημένη - χρησιμοποίησε «Στιγμιότυπα HTTP».")
 
     def layout_n(self):
         """Πλήθος κελιών από το combo ('1 κάμερα' -> 1)."""
