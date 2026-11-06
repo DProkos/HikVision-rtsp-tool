@@ -263,8 +263,10 @@ class HttpSnapshotWorker(QThread):
             elif now - self._fps_t >= 2:
                 self.real_fps = (self.seq - self._fps_n) / (now - self._fps_t)
                 self._fps_t, self._fps_n = now, self.seq
-            fps_txt = f"  {self.real_fps:.0f} fps" if self.real_fps else ""
-            self.info = f"{tag} {img.width()}x{img.height()}{fps_txt}"
+            fps_txt = f"  {self.real_fps:.1f} fps" if self.real_fps else ""
+            lat = getattr(self, "lat_ms", 0)
+            lat_txt = f"  ({lat:.0f} ms/καρέ)" if lat else ""
+            self.info = f"{tag} {img.width()}x{img.height()}{fps_txt}{lat_txt}"
             return True
         return False
 
@@ -323,6 +325,9 @@ class HttpSnapshotWorker(QThread):
             t0 = time.time()
             try:
                 data = client.get()
+                # χρόνος που χρειάστηκε το καταγραφικό για να απαντήσει (εξομαλυμένος)
+                dt = (time.time() - t0) * 1000
+                self.lat_ms = dt if not getattr(self, "lat_ms", 0) else 0.8 * self.lat_ms + 0.2 * dt
                 if self._emit_jpeg(data, "JPEG"):
                     fails = 0
                 else:
