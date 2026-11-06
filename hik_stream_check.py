@@ -161,9 +161,14 @@ def decode_rate(params, nals):
 # Αποκρυπτογράφηση (πειραματικά: ο αλγόριθμος της Hikvision δεν είναι δημόσιος)
 def aes(key, mode):
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    m = {"ecb": modes.ECB(), "cbc": modes.CBC(b"\x00" * 16),
-         "ctr": modes.CTR(b"\x00" * 16)}[mode]
+    iv = key[:16] if mode in ("cbc_k", "cfb_k") else b"\x00" * 16
+    m = {"ecb": modes.ECB(), "cbc": modes.CBC(b"\x00" * 16), "cbc_k": modes.CBC(iv),
+         "ctr": modes.CTR(b"\x00" * 16), "cfb": modes.CFB(b"\x00" * 16),
+         "cfb_k": modes.CFB(iv), "ofb": modes.OFB(b"\x00" * 16)}[mode]
     return Cipher(algorithms.AES(key), m).decryptor()
+
+
+MODES = ("ecb", "cbc", "cbc_k", "ctr", "cfb", "cfb_k", "ofb")
 
 
 def decrypt_nal(nal, key, mode, offset, blocks):
@@ -179,17 +184,34 @@ def decrypt_nal(nal, key, mode, offset, blocks):
 
 
 def key_candidates(code):
+    """Λίστα (όνομα, κλειδί). Δοκιμάζει πολλούς τρόπους παραγωγής κλειδιού από
+    τον κωδικό/κλειδί: ωμό κείμενο, hash, AES-128 (16 bytes) και AES-256 (32)."""
     c = code.encode()
-    md5 = hashlib.md5(c)
-    keys = {
-        "κωδικός+0x00": c.ljust(16, b"\x00")[:16],
-        "κωδικός+'0'": c.ljust(16, b"0")[:16],
-        "κωδικός x2": (c * 4)[:16],
-        "MD5(κωδικός)": md5.digest(),
-        "MD5 hex[:16]": md5.hexdigest()[:16].encode(),
-        "MD5 HEX[:16]": md5.hexdigest()[:16].upper().encode(),
-    }
-    return keys
+    md5 = hashlib.md5(c).digest()
+    md5h = hashlib.md5(c).hexdigest().encode()
+    sha = hashlib.sha256(c).digest()
+    out = [
+        ("κείμενο+0x00/16", c.ljust(16, b"\x00")[:16]),
+        ("κείμενο+'0'/16", c.ljust(16, b"0")[:16]),
+        ("κείμενο xN/16", (c * 16)[:16]),
+        ("κείμενο xN/32", (c * 32)[:32]),
+        ("MD5/16", md5),
+        ("MD5 hex[:16]", md5h[:16]),
+        ("MD5 HEX[:16]", md5h[:16].upper()),
+        ("MD5 hex/32", md5h),
+        ("SHA256[:16]", sha[:16]),
+        ("SHA256/32", sha),
+    ]
+    # Αν ο κωδικός είναι καθαρά hex, δοκίμασε και την hex-αποκωδικοποίησή του.
+    hx = re.fullmatch(r"[0-9a-fA-F]+", code)
+    if hx and len(code) % 2 == 0:
+        try:
+            b = bytes.fromhex(code)
+            out.append(("hex->bytes/16", b.ljust(16, b"\x00")[:16]))
+            out.append(("hex->bytes xN/16", (b * 16)[:16]))
+        except ValueError:
+            pass
+    return out
 
 
 def try_decrypt(params, nals, code, pps_ids, max_mb):
@@ -200,20 +222,28 @@ def try_decrypt(params, nals, code, pps_ids, max_mb):
         return None
     slices = [n for n in nals if n[0] & 0x1F in (1, 5)][:120]
     other = [n for n in nals if n[0] & 0x1F not in (1, 5, 7, 8)]
+    keys = key_candidates(code)
+    offsets = (1, 2, 4, 5)
+    combos = len(keys) * len(MODES) * len(offsets) * 3
+    out(f"  (δοκιμή {combos} συνδυασμών: {len(keys)} κλειδιά x {len(MODES)} τρόποι "
+        f"x {len(offsets)} σημεία x 3 μήκη)")
     results = []
-    for kname, key in key_candidates(code).items():
-        for mode in ("ecb", "cbc", "ctr"):
-            for offset in (1, 2, 4):
-                for blocks in (None, 1):
-                    dec = [decrypt_nal(n, key, mode, offset, blocks) for n in slices]
+    for kname, key in keys:
+        for mode in MODES:
+            for offset in offsets:
+                for blocks in (None, 1, 2):
+                    try:
+                        dec = [decrypt_nal(n, key, mode, offset, blocks) for n in slices]
+                    except Exception:
+                        continue
                     rate, _ = header_rate(dec, pps_ids, max_mb)
                     results.append((rate, kname, mode, offset, blocks, dec))
     results.sort(key=lambda r: -r[0])
-    out(f"{'κλειδί':16} {'mode':5} {'offset':6} {'μπλοκ':6} {'κεφαλίδες OK':>12}  καρέ")
+    out(f"{'κλειδί':18} {'τρόπος':7} {'σημείο':6} {'μήκος':6} {'κεφαλίδες OK':>12}  καρέ")
     best = None
-    for rate, kname, mode, offset, blocks, dec in results[:6]:
+    for rate, kname, mode, offset, blocks, dec in results[:10]:
         ok, tot = decode_rate(params, other + dec) if rate > 0.3 else (0, 0)
-        out(f"{kname:16} {mode:5} {offset:6} {'όλα' if blocks is None else blocks:>6} "
+        out(f"{kname:18} {mode:7} {offset:6} {'όλα' if blocks is None else blocks:>6} "
             f"{rate:12.0%}  {ok}/{tot}")
         if tot and ok / tot > 0.8 and best is None:
             best = (kname, mode, offset, blocks)
@@ -355,6 +385,9 @@ def main():
         out("=== Καταγραφικό ===")
         code = isapi_snapshot(ip, http_port, user, pwd, ch)
         out(f"  Κωδικός επαλήθευσης Hik-Connect: {'βρέθηκε' if code else 'δεν βρέθηκε'}")
+        manual = ask("Κλειδί/κωδικός κρυπτογράφησης (Enter = αυτός της συσκευής)", code)
+        if manual:
+            code = manual
         url = f"rtsp://{quote(user, safe='')}:{quote(pwd, safe='')}@{ip}:554/Streaming/Channels/{ch}02"
         out("\n=== Λήψη 8\" δευτερεύουσας ροής ===")
         try:
