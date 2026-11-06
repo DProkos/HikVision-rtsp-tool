@@ -244,12 +244,29 @@ class HikHttpCamera:
             client.close()
 
 
+def jpeg_size(data):
+    """(πλάτος, ύψος) από τα markers SOF ενός JPEG, ή None."""
+    i = 2
+    try:
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            m = data[i + 1]
+            if m in (0xC0, 0xC1, 0xC2):
+                return (data[i + 7] << 8 | data[i + 8], data[i + 5] << 8 | data[i + 6])
+            i += 2 + (data[i + 2] << 8 | data[i + 3])
+    except IndexError:
+        pass
+    return None
+
+
 def bench_url(url, user, password, seconds=4.0, parallel=1):
     """Μετρά τον ρυθμό ενός URL με `parallel` μόνιμες συνδέσεις ταυτόχρονα
     (όλες στην ίδια κάμερα). Επιστρέφει (fps συνολικά, διάμεσος ms, σφάλμα|None)."""
     import threading
     lock = threading.Lock()
-    lat, err = [], []
+    lat, err, dims = [], [], []
     stop = time.time() + seconds
 
     def worker(offset):
@@ -263,6 +280,8 @@ def bench_url(url, user, password, seconds=4.0, parallel=1):
                 if d[:2] == b"\xff\xd8":
                     with lock:
                         lat.append(dt)
+                        if not dims:
+                            dims.append(jpeg_size(d))
         except Exception as e:
             err.append(str(e)[:40])
         finally:
@@ -276,9 +295,9 @@ def bench_url(url, user, password, seconds=4.0, parallel=1):
         t.join()
     dur = time.time() - t0
     if not lat:
-        return 0.0, 0.0, (err[0] if err else "καμία εικόνα")
+        return 0.0, 0.0, (err[0] if err else "καμία εικόνα"), None
     lat.sort()
-    return len(lat) / dur, lat[len(lat) // 2] * 1000, (err[0] if err else None)
+    return len(lat) / dur, lat[len(lat) // 2] * 1000, (err[0] if err else None), (dims[0] if dims else None)
 
 
 def sweep(ip, port, user, password, channel, seconds=4.0):
@@ -294,12 +313,13 @@ def sweep(ip, port, user, password, channel, seconds=4.0):
         ("χωρίς ISAPI (/Streaming/..)", f"{base}/Streaming/channels/{ch}01/picture"),
     ]
     print(f"Δοκιμή εναλλακτικών δρόμων εικόνας, κανάλι {ch}, {seconds:.0f}s ο καθένας")
-    print(f"{'δρόμος':30} {'fps':>6} {'ms/καρέ':>8}  σχόλιο")
+    print(f"{'δρόμος':30} {'fps':>6} {'ms/καρέ':>8} {'μέγεθος εικόνας':>16}  σχόλιο")
     best = None
     for name, url in cands:
-        fps, med, err = bench_url(url, user, password, seconds)
+        fps, med, err, dims = bench_url(url, user, password, seconds)
         note = err or ""
-        print(f"{name:30} {fps:6.1f} {med:8.0f}  {note}")
+        dtxt = f"{dims[0]}x{dims[1]}" if dims else "-"
+        print(f"{name:30} {fps:6.1f} {med:8.0f} {dtxt:>16}  {note}")
         if fps > 0 and (best is None or fps > best[0]):
             best = (fps, name, url)
     if not best:
@@ -309,7 +329,7 @@ def sweep(ip, port, user, password, channel, seconds=4.0):
           f"Δοκιμή με πολλές παράλληλες συνδέσεις στην ίδια κάμερα:")
     print(f"{'συνδέσεις':>10} {'fps συνολικά':>13} {'ms/καρέ':>8}")
     for n in (1, 2, 3, 4, 6):
-        fps, med, err = bench_url(best[2], user, password, seconds, parallel=n)
+        fps, med, err, _ = bench_url(best[2], user, password, seconds, parallel=n)
         print(f"{n:10d} {fps:13.1f} {med:8.0f}  {err or ''}")
     print("\nΑν τα fps ανεβαίνουν με περισσότερες συνδέσεις, το καταγραφικό τις εξυπηρετεί"
           "\nπαράλληλα και μπορούμε να πάρουμε περισσότερα καρέ από την ίδια κάμερα."
