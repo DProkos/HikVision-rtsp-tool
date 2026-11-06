@@ -75,6 +75,8 @@ DEFAULT_CONFIG = {
     "layout": 4,            # 1, 4, 9, 16
     "ip_base": 16,          # D1 = ip_base+1  (δοκίμασε 32 αν δεν παίζουν οι IP)
     "http_port": 80,        # θύρα web, για τη λειτουργία Στιγμιότυπα HTTP
+    "fps": 2,               # ρυθμός καρέ στη λειτουργία HTTP (στιγμιότυπα)
+    "mjpeg": True,          # δοκίμασε ζωντανή ροή MJPEG (πιο real-time)
 }
 
 
@@ -115,6 +117,16 @@ def snapshot_url(cfg, cam_id):
     return f"http://{cfg['ip']}:{cfg.get('http_port', 80)}/ISAPI/Streaming/channels/{ch}01/picture"
 
 
+def mjpeg_urls(cfg, cam_id):
+    """Πιθανές διευθύνσεις ζωντανής ροής MJPEG (διαφέρουν ανά firmware)."""
+    ch = channel_number(cam_id, cfg["ip_base"])
+    host = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}"
+    return [
+        f"{host}/ISAPI/Streaming/channels/{ch}02/httpPreview",
+        f"{host}/ISAPI/Streaming/channels/{ch}01/httpPreview",
+    ]
+
+
 def make_http_opener(cfg):
     """Digest/Basic opener για τα στιγμιότυπα ISAPI."""
     base = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}"
@@ -128,15 +140,17 @@ def make_http_opener(cfg):
 
 # --------------------------------------------------------------------------- #
 class HttpSnapshotWorker(QThread):
-    """Ζωντανή εικόνα χωρίς RTSP: ζητά συνεχώς στιγμιότυπο JPEG μέσω HTTP.
-    Παράκαμψη για κρυπτογραφημένη ροή RTSP - ο δρόμος του στιγμιότυπου
-    δεν κρυπτογραφείται. Μικρό ρυθμό καρέ (~1 fps), αλλά καθαρή εικόνα."""
+    """Ζωντανή εικόνα χωρίς RTSP, μέσω του δρόμου HTTP που ΔΕΝ κρυπτογραφείται.
+    Δοκιμάζει πρώτα ζωντανή ροή εικόνων MJPEG (πιο real-time) και, αν δεν την
+    υποστηρίζει το καταγραφικό, πέφτει σε γρήγορα στιγμιότυπα JPEG."""
 
-    def __init__(self, cfg, cam_id, interval=1.0):
+    def __init__(self, cfg, cam_id, fps=2.0, want_mjpeg=True):
         super().__init__()
-        self.url = snapshot_url(cfg, cam_id)
+        self.pic_url = snapshot_url(cfg, cam_id)
+        self.mjpeg_urls = mjpeg_urls(cfg, cam_id)
         self.opener = make_http_opener(cfg)
-        self.interval = interval
+        self.interval = 1.0 / max(0.2, fps)
+        self.want_mjpeg = want_mjpeg
         self._run = True
         self.latest = None
         self.seq = 0
@@ -148,23 +162,78 @@ class HttpSnapshotWorker(QThread):
     def stop(self):
         self._run = False
 
+    def _reset_auth(self):
+        for h in self.opener.handlers:
+            if hasattr(h, "reset_retry_count"):
+                h.reset_retry_count()
+
+    def _emit_jpeg(self, data, tag):
+        img = QImage()
+        if data[:2] == b"\xff\xd8" and img.loadFromData(data, "JPG") and not img.isNull():
+            self.latest = img.convertToFormat(QImage.Format_RGB888)
+            self.seq += 1
+            self.status = ""
+            self.info = f"{tag} {img.width()}x{img.height()}"
+            return True
+        return False
+
     def run(self):
+        # 1) Προσπάθεια για ζωντανή ροή MJPEG (πιο real-time)
+        if self.want_mjpeg:
+            for url in self.mjpeg_urls:
+                if not self._run:
+                    return
+                if self._run_mjpeg(url):
+                    return                       # η ροή έτρεξε και τελείωσε/διακόπηκε
+        # 2) Εναλλακτικά: γρήγορα στιγμιότυπα
+        self._run_polling()
+
+    def _run_mjpeg(self, url):
+        """Επιστρέφει True αν ήταν όντως ροή MJPEG (ώστε να μη δοκιμαστεί polling)."""
+        try:
+            self._reset_auth()
+            r = self.opener.open(url, timeout=8)
+        except Exception:
+            return False
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "multipart" not in ctype:
+            r.close()
+            return False
+        self.status = ""
+        buf = b""
+        got = 0
+        try:
+            while self._run:
+                chunk = r.read(16384)
+                if not chunk:
+                    break
+                buf += chunk
+                # βγάλε κάθε ολόκληρο JPEG (ffd8 ... ffd9) από τον buffer
+                while True:
+                    s = buf.find(b"\xff\xd8")
+                    e = buf.find(b"\xff\xd9", s + 2) if s >= 0 else -1
+                    if s < 0 or e < 0:
+                        break
+                    if self._emit_jpeg(buf[s:e + 2], "MJPEG"):
+                        got += 1
+                    buf = buf[e + 2:]
+                if len(buf) > 4_000_000:         # προστασία, αν δεν βρίσκει όρια
+                    buf = buf[-1_000_000:]
+        except Exception:
+            pass
+        finally:
+            r.close()
+        return got > 0
+
+    def _run_polling(self):
         fails = 0
         while self._run:
             t0 = time.time()
             try:
-                # να στέλνεται ο κωδικός σε κάθε αίτημα (αλλιώς ψεύτικα 401)
-                for h in self.opener.handlers:
-                    if hasattr(h, "reset_retry_count"):
-                        h.reset_retry_count()
-                with self.opener.open(self.url, timeout=8) as r:
+                self._reset_auth()
+                with self.opener.open(self.pic_url, timeout=8) as r:
                     data = r.read()
-                img = QImage()
-                if data[:2] == b"\xff\xd8" and img.loadFromData(data, "JPG") and not img.isNull():
-                    self.latest = img.convertToFormat(QImage.Format_RGB888)
-                    self.seq += 1
-                    self.status = ""
-                    self.info = f"JPEG {img.width()}x{img.height()}"
+                if self._emit_jpeg(data, "JPEG"):
                     fails = 0
                 else:
                     fails += 1
@@ -178,11 +247,10 @@ class HttpSnapshotWorker(QThread):
                     self.status = "Η κάμερα δεν δίνει στιγμιότυπο"
                 else:
                     self.status = "Σφάλμα σύνδεσης"
-            # ρυθμός: περίμενε ό,τι μένει από το interval (ή λίγο παραπάνω σε σφάλμα)
             wait = max(self.interval, 2.0) if fails else self.interval
             end = time.time() + max(0.0, wait - (time.time() - t0))
             while self._run and time.time() < end:
-                time.sleep(0.05)
+                time.sleep(0.03)
 
 
 # --------------------------------------------------------------------------- #
@@ -454,6 +522,10 @@ class MainWindow(QMainWindow):
         self.sp_http = QSpinBox(); self.sp_http.setRange(1, 65535)
         self.sp_http.setValue(self.cfg.get("http_port", 80))
         self.sp_http.setToolTip("Θύρα web (HTTP) του καταγραφικού - για τα Στιγμιότυπα HTTP.")
+        self.sp_fps = QSpinBox(); self.sp_fps.setRange(1, 15)
+        self.sp_fps.setValue(self.cfg.get("fps", 2))
+        self.sp_fps.setToolTip("Ρυθμός καρέ για τη λειτουργία Στιγμιότυπα HTTP.\n"
+                               "Μεγαλύτερος = πιο real-time, αλλά φορτώνει το καταγραφικό.")
         self.cb_layout = QComboBox(); self.cb_layout.addItems(["1", "4", "9", "16"])
         self.cb_layout.setCurrentText(str(self.cfg["layout"]))
         self.sp_ipbase = QSpinBox(); self.sp_ipbase.setRange(0, 64); self.sp_ipbase.setValue(self.cfg["ip_base"])
@@ -472,7 +544,7 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         for lbl, w in [("IP:", self.ed_ip), ("Θύρα:", self.sp_port), ("Χρήστης:", self.ed_user),
                        ("Κωδικός:", self.ed_pass), ("Ροή:", self.cb_stream),
-                       ("HTTP:", self.sp_http),
+                       ("HTTP:", self.sp_http), ("fps:", self.sp_fps),
                        ("Πλέγμα:", self.cb_layout), ("IP βάση:", self.sp_ipbase)]:
             top.addWidget(QLabel(lbl)); top.addWidget(w)
         top.addWidget(btn_connect); top.addWidget(btn_stop)
@@ -530,14 +602,18 @@ class MainWindow(QMainWindow):
             "layout": int(self.cb_layout.currentText()),
             "ip_base": self.sp_ipbase.value(),
             "http_port": self.sp_http.value(),
+            "fps": self.sp_fps.value(),
+            "mjpeg": self.cfg.get("mjpeg", True),
         })
         save_config(self.cfg)
         return self.cfg
 
-    def make_worker(self, cfg, cam_id, stream):
+    def make_worker(self, cfg, cam_id, stream, fps=None):
         """Φτιάχνει τον σωστό worker ανάλογα με τη λειτουργία."""
         if stream == "snapshot":
-            return HttpSnapshotWorker(cfg, cam_id, interval=1.0)
+            return HttpSnapshotWorker(cfg, cam_id,
+                                      fps=fps if fps else cfg.get("fps", 2),
+                                      want_mjpeg=cfg.get("mjpeg", True))
         return StreamWorker(build_url(cfg, cam_id, stream))
 
     # ---------- πλέγμα
@@ -646,9 +722,9 @@ class MainWindow(QMainWindow):
         # Στη μονή προβολή: στιγμιότυπα αν είναι σε αυτή τη λειτουργία,
         # αλλιώς κύρια ροή (καλύτερη ποιότητα)
         single = "snapshot" if cfg["stream"] == "snapshot" else "main"
-        w = self.make_worker(cfg, cam[0], single)
-        if single == "snapshot":
-            w.interval = 0.5                       # πιο γρήγορα στη μονή προβολή
+        # στη μονή προβολή πιο γρήγορα (τουλάχιστον 4 fps)
+        fps = max(4, cfg.get("fps", 2)) if single == "snapshot" else None
+        w = self.make_worker(cfg, cam[0], single, fps=fps)
         self.tiles[0].play(cam, w)
         self.running = True
         self.lbl_page.setText("Μονή")
