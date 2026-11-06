@@ -188,21 +188,28 @@ class HikHttpCamera:
             row = {"url": url, "status": None, "content_type": "", "jpeg": False, "note": ""}
             c = DigestKeepAliveClient(url, self.user, self.password, self.timeout)
             try:
-                r, _ = c.open(stream=True)
+                r, body = c.open(stream=True)      # body=None μόνο αν 200 + stream
                 row["status"] = r.status
-                row["content_type"] = (r.getheader("Content-Type") or "").split(";")[0]
-                if r.status == 200:
-                    if "multipart" in (r.getheader("Content-Type") or "").lower():
-                        # διάβασε λίγο για να δεις αν έρχονται JPEG
-                        chunk = r.read(65536)
-                        row["jpeg"] = b"\xff\xd8" in chunk
-                        row["note"] = "ροή MJPEG" if row["jpeg"] else "multipart χωρίς JPEG (ίσως H.264)"
-                    else:
+                ctype = (r.getheader("Content-Type") or "")
+                row["content_type"] = ctype.split(";")[0]
+                if r.status == 200 and "multipart" in ctype.lower():
+                    chunk = r.read(65536)          # διάβασε λίγο: έρχονται JPEG;
+                    row["jpeg"] = b"\xff\xd8" in chunk
+                    row["note"] = "ροή MJPEG" if row["jpeg"] else "multipart χωρίς JPEG (ίσως H.264)"
+                elif r.status == 200:
+                    if body is None:               # stream mode: το σώμα δεν διαβάστηκε
                         body = r.read(65536)
-                        row["jpeg"] = body[:2] == b"\xff\xd8"
-                        row["note"] = "ένα JPEG" if row["jpeg"] else "όχι JPEG"
+                    row["jpeg"] = (body or b"")[:2] == b"\xff\xd8"
+                    row["note"] = "ένα JPEG" if row["jpeg"] else "όχι JPEG"
                 else:
-                    row["note"] = "δεν υποστηρίζεται" if r.status == 404 else f"HTTP {r.status}"
+                    txt = (body or b"").decode("utf-8", "replace")
+                    detail = " · ".join(m.group(1).strip() for m in
+                                        re.finditer(r"<(?:statusString|subStatusCode|errorMsg)>"
+                                                    r"([^<]+)</", txt))
+                    if r.status == 404:
+                        row["note"] = "δεν υποστηρίζεται (404)"
+                    else:
+                        row["note"] = f"HTTP {r.status}" + (f" - {detail}" if detail else "")
             except Exception as e:
                 row["note"] = f"σφάλμα: {str(e)[:50]}"
             finally:
