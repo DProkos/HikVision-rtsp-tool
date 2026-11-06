@@ -717,7 +717,16 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter()
         left = QWidget(); lv = QVBoxLayout(left); lv.setContentsMargins(0, 0, 0, 0)
-        lv.addWidget(QLabel("<b>Κάμερες</b>")); lv.addWidget(self.cam_list)
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("🔍 Αναζήτηση κάμερας (όνομα ή A6)...")
+        self.ed_search.setClearButtonEnabled(True)
+        self.ed_search.setToolTip("Γράψε μέρος του ονόματος ή του κωδικού (π.χ. tameia, A6, D5).\n"
+                                  "Enter: άνοιγμα της πρώτης κάμερας που βρέθηκε.")
+        self.ed_search.textChanged.connect(self.filter_cameras)
+        self.ed_search.returnPressed.connect(self.open_first_match)
+        self.lbl_found = QLabel("")
+        lv.addWidget(QLabel("<b>Κάμερες</b>")); lv.addWidget(self.ed_search)
+        lv.addWidget(self.cam_list); lv.addWidget(self.lbl_found)
         splitter.addWidget(left); splitter.addWidget(self.grid_host)
         splitter.setStretchFactor(1, 1)
 
@@ -796,6 +805,49 @@ class MainWindow(QMainWindow):
         if self.running:
             self.play_page()
         self.update_page_label()
+
+    @staticmethod
+    def _norm(t):
+        """Πεζά + χωρίς τόνους, ώστε το «ταμεια»/«TAMEIA»/«ταμεία» να ταιριάζουν ευέλικτα."""
+        import unicodedata
+        t = unicodedata.normalize("NFD", t.lower())
+        return "".join(c for c in t if unicodedata.category(c) != "Mn")
+
+    # Τα ονόματα καμερών είναι λατινικά (greeklish). Αν γράψεις ελληνικά, δοκιμάζουμε
+    # δύο μετατροπές: αντιστοιχία πλήκτρων (η->H, θ->U) και φωνητική (η->I, θ->TH).
+    _KEYS = dict(zip("αβγδεζηθικλμνξοπρσςτυφχψω", "abgdezhuiklmnjoprswtyfxcv"))
+    _PHON = {"α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η": "i",
+             "θ": "th", "ι": "i", "κ": "k", "λ": "l", "μ": "m", "ν": "n", "ξ": "x",
+             "ο": "o", "π": "p", "ρ": "r", "σ": "s", "ς": "s", "τ": "t", "υ": "y",
+             "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o"}
+
+    def _variants(self, text):
+        t = self._norm(text)
+        phon = "".join(self._PHON.get(c, c) for c in t)
+        return {t, "".join(self._KEYS.get(c, c) for c in t), phon,
+                phon.replace("y", "i")}                # υ -> i (π.χ. KALINTIKA)
+
+    def filter_cameras(self, text=""):
+        variants = [v.split() for v in self._variants(text)]
+        active = bool(text.strip())
+        shown = 0
+        for i in range(self.cam_list.count()):
+            it = self.cam_list.item(i)
+            hay = self._norm(it.text())
+            # ταιριάζει αν κάποια εκδοχή έχει ΟΛΕΣ τις λέξεις μέσα στο όνομα
+            ok = any(all(w in hay for w in words) for words in variants)
+            it.setHidden(not ok)
+            shown += ok
+        self.lbl_found.setText(
+            f"{shown} από {self.cam_list.count()} κάμερες" if active else "")
+
+    def open_first_match(self):
+        for i in range(self.cam_list.count()):
+            it = self.cam_list.item(i)
+            if not it.isHidden():
+                self.cam_list.setCurrentItem(it)
+                self.on_list_double(it)
+                return
 
     def apply_mode_fields(self):
         """Δείχνει μόνο τα πεδία που αφορούν την επιλεγμένη ροή:
