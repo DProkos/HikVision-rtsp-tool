@@ -56,6 +56,23 @@ response = MD5(HA1 : nonce : nc : cnonce : "auth" : HA2)
 `cnonce` το φτιάχνουμε μία φορά, το `nc` αυξάνει σε κάθε αίτημα. Αν το DVR
 απαντήσει ξανά 401 (παλιό nonce), ξαναδιαβάζουμε το challenge και συνεχίζουμε.
 
+## Έλεγχος τι υποστηρίζει το καταγραφικό
+
+```bash
+python hik_http_client.py --ip <IP> --user admin --password <pass> --channel 1 --probe
+```
+Δείχνει, για κάθε endpoint, status + content-type + λόγο αποτυχίας. Προσοχή:
+πολλά Turbo HD (π.χ. DS-7216HUHI-K2, firmware V4.21.x) **δεν υποστηρίζουν MJPEG**
+και απαντούν `403 - invalidOperation` στο `httpPreview`. Τότε μένει μόνο το
+polling στο `picture`.
+
+Ταβάνι του polling σε μία κάμερα (καρέ όσο πιο γρήγορα γίνεται):
+```bash
+python hik_http_client.py --ip <IP> --user admin --password <pass> --channel 1 --bench
+```
+Τυπώνει fps, και χρόνο ανά καρέ (διάμεσος/p90) - το όριο το βάζει το latency
+δικτύου + ο χρόνος που θέλει το DVR να φτιάξει κάθε JPEG.
+
 ## Δοκιμή χωρίς συσκευή
 
 ```bash

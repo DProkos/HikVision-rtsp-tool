@@ -254,12 +254,37 @@ def main():
     ap.add_argument("--fps", type=float, default=15)
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--no-mjpeg", action="store_true", help="μόνο polling στιγμιοτύπων")
+    ap.add_argument("--bench", action="store_true",
+                    help="μέτρηση ταβανιού polling: καρέ όσο πιο γρήγορα γίνεται")
     ap.add_argument("--probe", action="store_true",
                     help="μόνο έλεγχος: τι υποστηρίζει το καταγραφικό (χωρίς μέτρηση)")
     ap.add_argument("--save", help="αποθήκευση του τελευταίου καρέ σε αρχείο")
     a = ap.parse_args()
 
     cam = HikHttpCamera(a.ip, a.user, a.password, a.channel, a.port)
+    if a.bench:
+        # μέτρηση ταβανιού polling: ζήτα καρέ όσο πιο γρήγορα γίνεται (χωρίς παύση)
+        client = DigestKeepAliveClient(cam.picture_url(), a.user, a.password)
+        times, size, t0 = [], 0, time.time()
+        while time.time() - t0 < a.seconds:
+            s = time.time()
+            try:
+                data = client.get()
+            except Exception as e:
+                print("σφάλμα:", str(e)[:60]); break
+            times.append(time.time() - s)
+            size += len(data)
+        client.close()
+        if times:
+            times.sort()
+            med = times[len(times) // 2]
+            p90 = times[int(len(times) * 0.9)]
+            print(f"polling (χωρίς όριο fps), μία κάμερα, {len(times)} καρέ:")
+            print(f"  ταβάνι ~{len(times) / (time.time() - t0):.1f} fps")
+            print(f"  χρόνος ανά καρέ: διάμεσος {med*1000:.0f} ms, p90 {p90*1000:.0f} ms, "
+                  f"min {times[0]*1000:.0f} ms")
+            print(f"  μέσο μέγεθος JPEG: {size / len(times) / 1024:.1f} KB")
+        return
     if a.probe:
         print(f"Έλεγχος endpoints εικόνας (κανάλι {a.channel}):")
         for row in cam.probe():
