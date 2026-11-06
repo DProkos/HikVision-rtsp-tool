@@ -665,8 +665,11 @@ class MainWindow(QMainWindow):
         self.sp_fps.setValue(self.cfg.get("fps", 2))
         self.sp_fps.setToolTip("Ρυθμός καρέ για τη λειτουργία Στιγμιότυπα HTTP.\n"
                                "Μεγαλύτερος = πιο real-time, αλλά φορτώνει το καταγραφικό.")
-        self.cb_layout = QComboBox(); self.cb_layout.addItems(["1", "4", "9", "16"])
-        self.cb_layout.setCurrentText(str(self.cfg["layout"]))
+        self.cb_layout = QComboBox(); self.cb_layout.addItems(["1 κάμερα", "4", "9", "16"])
+        self.cb_layout.setCurrentIndex([1, 4, 9, 16].index(self.cfg["layout"])
+                                       if self.cfg["layout"] in (1, 4, 9, 16) else 1)
+        self.cb_layout.setToolTip("«1 κάμερα»: μία κάμερα σε όλο το παράθυρο, με τη μέγιστη\n"
+                                  "ταχύτητα. Άλλαξε κάμερα με ◀ ▶ ή διπλό κλικ στη λίστα.")
         self.sp_ipbase = QSpinBox(); self.sp_ipbase.setRange(0, 64); self.sp_ipbase.setValue(self.cfg["ip_base"])
         self.sp_ipbase.setToolTip("Αρίθμηση RTSP IP καναλιών: D1 = τιμή+1.\n"
                                   "Αν οι D4/D5 δεν παίζουν με 16, δοκίμασε 32.")
@@ -724,7 +727,7 @@ class MainWindow(QMainWindow):
         self.cb_layout.currentTextChanged.connect(lambda _: self.relayout(reset_page=True))
         self.cb_stream.currentIndexChanged.connect(lambda _: self.restart_if_running())
         self.running = False
-        self.build_tiles(int(self.cb_layout.currentText()))
+        self.build_tiles(self.layout_n())
 
         # Ανανέωση οθόνης ~12 fps από το τελευταίο καρέ κάθε κάμερας
         self.timer = QTimer(self)
@@ -739,7 +742,7 @@ class MainWindow(QMainWindow):
             "user": self.ed_user.text().strip(),
             "password": self.ed_pass.text(),
             "stream": ["sub", "main", "snapshot"][self.cb_stream.currentIndex()],
-            "layout": int(self.cb_layout.currentText()),
+            "layout": self.layout_n(),
             "ip_base": self.sp_ipbase.value(),
             "http_port": self.sp_http.value(),
             "fps": self.sp_fps.value(),
@@ -784,13 +787,20 @@ class MainWindow(QMainWindow):
         self.single_mode = None
         if reset_page:
             self.page = 0
-        self.build_tiles(int(self.cb_layout.currentText()))
+        self.build_tiles(self.layout_n())
         if self.running:
             self.play_page()
         self.update_page_label()
 
+    def layout_n(self):
+        """Πλήθος κελιών από το combo ('1 κάμερα' -> 1)."""
+        return int(self.cb_layout.currentText().split()[0])
+
     def update_page_label(self):
-        self.lbl_page.setText(f"Σελ. {self.page + 1}/{self.pages()}")
+        if len(self.tiles) == 1 and not self.single_mode:
+            self.lbl_page.setText(f"Κάμερα {self.page + 1}/{len(DEFAULT_CAMERAS)}")
+        else:
+            self.lbl_page.setText(f"Σελ. {self.page + 1}/{self.pages()}")
 
     def change_page(self, d):
         if self.single_mode:
@@ -808,7 +818,9 @@ class MainWindow(QMainWindow):
             if i < len(cams):
                 # πολλές συνδέσεις ανά κάμερα μόνο σε μικρό πλέγμα (αλλιώς φορτώνει το DVR)
                 conns = cfg.get("conns", 3) if n <= 4 else 1
-                t.play(cams[i], self.make_worker(cfg, cams[i][0], cfg["stream"], conns=conns))
+                # «1 κάμερα»: όσο πιο γρήγορα αντέχει το DVR (όπως η μονή προβολή)
+                fps = max(25, cfg.get("fps", 2)) if n == 1 and cfg["stream"] == "snapshot" else None
+                t.play(cams[i], self.make_worker(cfg, cams[i][0], cfg["stream"], fps=fps, conns=conns))
             else:
                 t.stop()
 
@@ -819,8 +831,8 @@ class MainWindow(QMainWindow):
             return
         self.running = True
         self.single_mode = None
-        if len(self.tiles) != int(self.cb_layout.currentText()):
-            self.build_tiles(int(self.cb_layout.currentText()))
+        if len(self.tiles) != self.layout_n():
+            self.build_tiles(self.layout_n())
         self.play_page()
         self.update_page_label()
 
@@ -880,7 +892,12 @@ class MainWindow(QMainWindow):
         if not cfg["ip"] or cfg["ip"].endswith("."):
             QMessageBox.warning(self, "IP", "Συμπλήρωσε τη διεύθυνση IP του καταγραφικού.")
             return
-        if self.selected_tile and not self.single_mode:
+        if len(self.tiles) == 1 and not self.single_mode:      # λειτουργία «1 κάμερα»
+            self.page = next(i for i, c in enumerate(DEFAULT_CAMERAS) if c[0] == cam[0])
+            self.running = True
+            self.play_page()
+            self.update_page_label()
+        elif self.selected_tile and not self.single_mode:
             self.running = True
             self.selected_tile.play(cam, self.make_worker(cfg, cam[0], cfg["stream"], conns=cfg.get("conns", 3)))
         else:
