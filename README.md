@@ -1,3 +1,5 @@
+<p align="center"><img src="packaging/assets/logo.png" width="120" alt="logo"></p>
+
 # HikVision RTSP Tool
 
 Μικρό εργαλείο (PyQt5) για ζωντανή προβολή RTSP από καταγραφικά Hikvision
@@ -30,6 +32,28 @@ python hik_rtsp_viewer.py
 `rtsp://USER:PASS@IP:554/Streaming/Channels/<κανάλι><01|02>`
 (01 = κύρια ροή, 02 = δευτερεύουσα). Οι IP κάμερες (D1, D2, …) αριθμούνται
 από την τιμή «IP βάση» + 1 (συνήθως 16 ή 32).
+
+## Δημιουργία .exe (Windows)
+
+Όλα βρίσκονται στον φάκελο [`packaging/`](packaging/):
+
+| Αρχείο | Τι κάνει |
+|---|---|
+| `build_exe.bat` | Διπλό κλικ: εγκαθιστά τις απαιτήσεις και φτιάχνει το exe |
+| `build_exe.py` | Το ίδιο από γραμμή εντολών (`python packaging/build_exe.py`) |
+| `make_logo.py` | Ξαναφτιάχνει το λογότυπο και το εικονίδιο (`assets/logo.png`, `assets/icon.ico`) |
+
+```bash
+pip install -r requirements.txt
+python packaging/build_exe.py            # ένα αρχείο: packaging/dist/HikRTSPViewer.exe
+python packaging/build_exe.py --onedir   # φάκελος (ξεκινά πιο γρήγορα)
+python packaging/build_exe.py --console  # με κονσόλα, για να βλέπεις σφάλματα
+```
+
+- Το PyInstaller **δεν κάνει cross-compile**: για `.exe` τρέξε το στα Windows.
+- Οι ρυθμίσεις (`hik_viewer_config.json`), τα στιγμιότυπα και το `discover_debug.txt`
+  αποθηκεύονται **δίπλα στο exe**.
+- Γρήγορος έλεγχος του exe: `HikRTSPViewer.exe --selftest` (με `--console` build).
 
 ## Πλήρης οθόνη και προσαρμογή στο μέγεθος
 

@@ -46,14 +46,24 @@ if av is None and cv2 is None:
     sys.exit("Λείπει βιβλιοθήκη βίντεο:  pip install av")
 
 from PyQt5.QtCore import Qt, QEvent, QPoint, QRect, QSize, QThread, QTimer, pyqtSignal  # noqa: E402
-from PyQt5.QtGui import QImage, QPixmap, QFont, QFontMetrics, QPainter, QColor, QKeySequence  # noqa: E402
+from PyQt5.QtGui import (QImage, QPixmap, QFont, QFontMetrics, QPainter, QColor,  # noqa: E402
+                         QKeySequence, QIcon)
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QComboBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
     QSpinBox, QSplitter, QVBoxLayout, QWidget, QSizePolicy, QShortcut, QLayout,
 )
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FROZEN = getattr(sys, "frozen", False)          # True όταν τρέχει ως exe (PyInstaller)
+# Ρυθμίσεις/στιγμιότυπα: δίπλα στο exe (ο προσωρινός φάκελος του onefile σβήνεται στο κλείσιμο)
+APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(*parts):
+    """Αρχείο που ΠΑΚΕΤΑΡΕΤΑΙ μέσα στο exe (π.χ. λογότυπο). Δουλεύει και από τον κώδικα."""
+    if FROZEN:
+        return os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "assets", *parts)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "packaging", "assets", *parts)
 CONFIG_FILE = os.path.join(APP_DIR, "hik_viewer_config.json")
 SNAP_DIR = os.path.join(APP_DIR, "snapshots")
 
@@ -951,7 +961,13 @@ class MainWindow(QMainWindow):
         self.ed_search.textChanged.connect(self.filter_cameras)
         self.ed_search.returnPressed.connect(self.open_first_match)
         self.lbl_found = QLabel("")
-        lv.addWidget(QLabel("<b>Κάμερες</b>")); lv.addWidget(self.ed_search)
+        head = QHBoxLayout(); head.setContentsMargins(0, 0, 0, 0)
+        logo_lbl = QLabel()
+        logo_px = QPixmap(resource_path("logo.png"))
+        if not logo_px.isNull():
+            logo_lbl.setPixmap(logo_px.scaledToHeight(30, Qt.SmoothTransformation))
+        head.addWidget(logo_lbl); head.addWidget(QLabel("<b>Κάμερες</b>")); head.addStretch()
+        lv.addLayout(head); lv.addWidget(self.ed_search)
         self.btn_discover = QPushButton("🔍 Εύρεση καμερών από το καταγραφικό")
         self.btn_discover.setToolTip("Ρωτά το καταγραφικό ποιες κάμερες έχει (ονόματα, IP κάμερες,\n"
                                      "κατάσταση) και φτιάχνει τη λίστα μόνο του. Δεν αλλάζει τίποτα\n"
@@ -1381,9 +1397,32 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if sys.platform == "win32":
+        try:        # ώστε η γραμμή εργασιών να δείχνει το δικό μας εικονίδιο (όχι της Python)
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("hikrtsp.viewer.1")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    icon = QIcon(resource_path("logo.png"))
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     w = MainWindow()
+    if "--selftest" in sys.argv:        # γρήγορος έλεγχος εγκατάστασης/exe, χωρίς να ανοίξει παράθυρο
+        w.read_cfg()                     # γράφει το config δίπλα στο πρόγραμμα
+        print("frozen:", FROZEN)
+        print("app_dir:", APP_DIR)
+        print("logo:", resource_path("logo.png"), "| φορτώθηκε:", not QPixmap(resource_path("logo.png")).isNull())
+        print("config:", CONFIG_FILE, "| υπάρχει:", os.path.exists(CONFIG_FILE))
+        print("κάμερες:", len(DEFAULT_CAMERAS))
+        if av is not None:
+            print("PyAV:", av.__version__, "| αποκωδικοποιητές h264/hevc:",
+                  "h264" in av.codecs_available, "hevc" in av.codecs_available)
+        else:
+            print("PyAV: δεν υπάρχει (χρήση OpenCV)")
+        sys.stdout.flush()
+        os._exit(0)
     w.show()
     code = app.exec_()
     # τυχόν threads που περιμένουν ακόμη timeout δικτύου -> άμεση έξοδος
