@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Ψεύτικο καταγραφικό για δοκιμές χωρίς συσκευή.
+
+Μιμείται τα endpoints εικόνας του ISAPI με HTTP Digest (qop=auth) και
+keep-alive, και ελέγχει σωστά το digest response.
+
+    python mock_dvr.py --port 8080 --jpeg εικόνα.jpg [--mjpeg] [--delay 0.02]
+
+  --jpeg    το JPEG που θα σερβίρει (χωρίς αυτό: ψεύτικα bytes FFD8..FFD9,
+            αρκετά για μέτρηση fps, όχι για προβολή)
+  --mjpeg   ενεργοποιεί το /httpPreview (ροή multipart)
+  --delay   χρόνος «δημιουργίας» κάθε εικόνας σε δευτερόλεπτα
+Χρήστης/κωδικός: admin / test
+"""
+import argparse
+import hashlib
+import re
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+USER, PASSWORD, REALM, NONCE = "admin", "test", "DS", "mocknonce0001"
+STATS = {"connections": 0, "requests": 0, "rejected": 0}
+
+
+def md5(s):
+    return hashlib.md5(s.encode()).hexdigest()
+
+
+def make_handler(jpeg, delay, mjpeg):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"          # keep-alive, όπως τα πραγματικά DVR
+
+        def log_message(self, *a):
+            pass
+
+        def setup(self):
+            super().setup()
+            STATS["connections"] += 1
+
+        def _empty(self, code, extra=None):
+            self.send_response(code)
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _authorized(self):
+            a = self.headers.get("Authorization", "")
+            if not a.startswith("Digest"):
+                self._empty(401, {"WWW-Authenticate":
+                                  f'Digest realm="{REALM}", qop="auth", nonce="{NONCE}", opaque="op"'})
+                return False
+            d = {k: (x or y) for k, x, y in re.findall(r'(\w+)=(?:"([^"]*)"|([^,\s]+))', a)}
+            ha1 = md5(f"{USER}:{REALM}:{PASSWORD}")
+            ha2 = md5(f"GET:{d.get('uri', '')}")
+            if d.get("response") != md5(f"{ha1}:{NONCE}:{d.get('nc')}:{d.get('cnonce')}:auth:{ha2}"):
+                STATS["rejected"] += 1
+                self._empty(403)
+                return False
+            return True
+
+        def do_GET(self):
+            STATS["requests"] += 1
+            if not self._authorized():
+                return
+            if self.path.endswith("/picture"):
+                time.sleep(delay)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(jpeg)))
+                self.end_headers()
+                self.wfile.write(jpeg)
+            elif self.path.endswith("/httpPreview") and mjpeg:
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+                try:
+                    while True:
+                        time.sleep(delay or 0.04)
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n"
+                                         + f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
+                                         + jpeg + b"\r\n")
+                        self.wfile.flush()
+                except OSError:
+                    pass
+                self.close_connection = True
+            else:
+                self._empty(404)
+    return Handler
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--jpeg")
+    ap.add_argument("--mjpeg", action="store_true")
+    ap.add_argument("--delay", type=float, default=0.02)
+    a = ap.parse_args()
+    jpeg = open(a.jpeg, "rb").read() if a.jpeg else b"\xff\xd8" + b"\x00" * 20000 + b"\xff\xd9"
+    srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(jpeg, a.delay, a.mjpeg))
+    print(f"mock DVR στο http://127.0.0.1:{a.port}  (admin/test)  Ctrl+C για τέλος")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    print("στατιστικά:", STATS)
+
+
+if __name__ == "__main__":
+    main()
