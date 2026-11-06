@@ -5,7 +5,7 @@
 Μικρό εργαλείο (PyQt5) για ζωντανή προβολή RTSP από καταγραφικά Hikvision
 (φτιαγμένο για το DS-7216HUHI-K2), μαζί με εργαλεία διάγνωσης.
 
-[⬇ Download ](https://github.com/DProkos/HikVision-rtsp-tool/releases/latest/download/HikRTSPViewer.exe)
+[⬇ Download EXE ](https://github.com/DProkos/HikVision-rtsp-tool/releases/latest/download/HikRTSPViewer.exe)
 
 ## Εγκατάσταση
 
