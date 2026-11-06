@@ -102,8 +102,24 @@ def save_config(cfg):
         print("Αποτυχία αποθήκευσης ρυθμίσεων:", e)
 
 
+CHANNEL_OVERRIDE = {}      # id κάμερας -> πραγματικός αριθμός καναλιού (από την ανίχνευση)
+OFFLINE_IDS = set()        # IP κάμερες που το καταγραφικό δηλώνει εκτός (offline)
+
+
+def apply_cameras(cams):
+    """Αντικαθιστά τη λίστα καμερών (στη θέση της, ώστε να ισχύει παντού).
+    cams: λίστα από dict {id, name, channel}."""
+    DEFAULT_CAMERAS[:] = [(c["id"], c["name"]) for c in cams]
+    CHANNEL_OVERRIDE.clear()
+    CHANNEL_OVERRIDE.update({c["id"]: int(c["channel"]) for c in cams if c.get("channel")})
+    OFFLINE_IDS.clear()
+    OFFLINE_IDS.update(c["id"] for c in cams if c.get("online") is False)
+
+
 def channel_number(cam_id, ip_base):
-    """A5 -> 5,  D4 -> ip_base + 4"""
+    """A5 -> 5,  D4 -> ip_base + 4  (εκτός αν η ανίχνευση ξέρει το πραγματικό κανάλι)"""
+    if cam_id in CHANNEL_OVERRIDE:
+        return CHANNEL_OVERRIDE[cam_id]
     n = int(cam_id[1:])
     return n if cam_id[0] == "A" else ip_base + n
 
@@ -227,6 +243,131 @@ class FastHttpClient:
         if r.status != 200:
             raise OSError(f"HTTP {r.status}")
         return body
+
+
+# --------------------------------------------------------------------------- #
+# Ανίχνευση καμερών από το ίδιο το καταγραφικό (ISAPI)
+def _strip_ns(xml):
+    return re.sub(r'\sxmlns(?::\w+)?="[^"]*"', "", xml)
+
+
+def _isapi_get(cfg, path, timeout=6):
+    """(status, κείμενο). Δεν σηκώνει εξαίρεση για HTTP σφάλματα."""
+    url = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}{path}"
+    c = FastHttpClient(url, cfg["user"], cfg["password"], timeout=timeout)
+    try:
+        return 200, c.get().decode("utf-8", "replace")
+    except OSError as e:
+        m = re.search(r"HTTP (\d+)", str(e))
+        return (int(m.group(1)) if m else 0), ""
+    except Exception:
+        return 0, ""
+    finally:
+        c.close()
+
+
+def _elements(xml, tag):
+    """Όλα τα στοιχεία <tag> του XML (αγνοεί namespaces)."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(_strip_ns(xml))
+    except ET.ParseError:
+        return []
+    return list(root.iter(tag))
+
+
+def _text(el, tag, default=""):
+    f = el.find(tag)
+    return (f.text or "").strip() if f is not None and f.text else default
+
+
+def discover_cameras(cfg):
+    """Ρωτά το καταγραφικό ποιες κάμερες έχει. Επιστρέφει
+    {"cameras": [{id, name, channel, kind, online}], "analog_count": n,
+     "log": [(path, status)], "raw": {path: κείμενο}}.  Δεν αλλάζει τίποτα στη συσκευή."""
+    log, raw = [], {}
+
+    def get(path):
+        st, txt = _isapi_get(cfg, path)
+        log.append((path, st))
+        raw[path] = txt
+        return txt if st == 200 else ""
+
+    dev = get("/ISAPI/System/deviceInfo")
+    m = re.search(r"<analogChannelNum>(\d+)</analogChannelNum>", dev)
+    analog_count = int(m.group(1)) if m else 0
+
+    # αναλογικές εισόδοι (id + όνομα)
+    inputs = {}
+    for el in _elements(get("/ISAPI/System/Video/inputs/channels"), "VideoInputChannel"):
+        try:
+            inputs[int(_text(el, "id"))] = _text(el, "name")
+        except ValueError:
+            pass
+
+    # IP κάμερες (id + όνομα + διεύθυνση) και κατάσταση online
+    proxies = {}
+    for el in _elements(get("/ISAPI/ContentMgmt/InputProxy/channels"), "InputProxyChannel"):
+        try:
+            cid = int(_text(el, "id"))
+        except ValueError:
+            continue
+        ip = ""
+        d = el.find("sourceInputPortDescriptor")
+        if d is not None:
+            ip = _text(d, "ipAddress")
+        proxies[cid] = (_text(el, "name"), ip)
+    online = {}
+    for el in _elements(get("/ISAPI/ContentMgmt/InputProxy/channels/status"), "InputProxyChannelStatus"):
+        try:
+            online[int(_text(el, "id"))] = _text(el, "online").lower() == "true"
+        except ValueError:
+            pass
+
+    # κανάλια που ξέρει το σύστημα ροής (101, 102, 1701 ...) -> πραγματικοί αριθμοί καναλιών
+    stream_channels = set()
+    for el in _elements(get("/ISAPI/Streaming/channels"), "StreamingChannel"):
+        v = _text(el, "id")
+        if v.isdigit() and len(v) >= 3:
+            stream_channels.add(int(v) // 100)
+
+    if not analog_count:                     # fallback: όσα ανέφερε η λίστα εισόδων / ρύθμιση
+        analog_count = (min(len(inputs), 16) if inputs and not proxies
+                        else cfg.get("ip_base", 16))
+    cams = []
+    for n in sorted(inputs):
+        if n <= analog_count:
+            cams.append({"id": f"A{n}", "name": inputs[n] or f"Camera {n:02d}",
+                         "channel": n, "kind": "analog", "online": None})
+    if not inputs:                           # δεν δόθηκαν ονόματα: φτιάξε από τα κανάλια ροής
+        for n in sorted(c for c in stream_channels if c <= analog_count):
+            cams.append({"id": f"A{n}", "name": f"Camera {n:02d}", "channel": n,
+                         "kind": "analog", "online": None})
+    # αντιστοίχιση IP καμερών -> κανάλι ροής
+    ip_streams = sorted(c for c in stream_channels if c > analog_count)
+    ids = sorted(proxies)
+    for k, cid in enumerate(ids):
+        ch = ip_streams[k] if len(ip_streams) == len(ids) else analog_count + cid
+        name, ipaddr = proxies[cid]
+        cams.append({"id": f"D{cid}", "name": name or f"IPCamera {cid:02d}",
+                     "channel": ch, "kind": "ip", "ip": ipaddr,
+                     "online": online.get(cid)})
+    return {"cameras": cams, "analog_count": analog_count, "log": log, "raw": raw}
+
+
+class DiscoverWorker(QThread):
+    done = pyqtSignal(object)
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = dict(cfg)
+
+    def run(self):
+        try:
+            res = discover_cameras(self.cfg)
+        except Exception as e:                       # δίκτυο κλπ.
+            res = {"cameras": [], "analog_count": 0, "log": [], "raw": {}, "error": str(e)}
+        self.done.emit(res)
 
 
 # --------------------------------------------------------------------------- #
@@ -632,6 +773,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Hik RTSP Viewer - DS-7216HUHI-K2")
         self.resize(1400, 820)
         self.cfg = load_config()
+        if self.cfg.get("cameras"):                 # λίστα από προηγούμενη ανίχνευση
+            try:
+                apply_cameras(self.cfg["cameras"])
+            except Exception:
+                pass
         self.tiles = []
         self.page = 0
         self.selected_tile = None
@@ -701,10 +847,7 @@ class MainWindow(QMainWindow):
         # ---------- λίστα καμερών
         self.cam_list = QListWidget()
         self.cam_list.setMaximumWidth(250)
-        for cid, name in DEFAULT_CAMERAS:
-            it = QListWidgetItem(f"{cid}  {name}")
-            it.setData(Qt.UserRole, (cid, name))
-            self.cam_list.addItem(it)
+        self.populate_camera_list()
         self.cam_list.itemDoubleClicked.connect(self.on_list_double)
         self.cam_list.setToolTip("Διπλό κλικ: παίζει την κάμερα στο επιλεγμένο κελί\n"
                                  "(ή σε μονή προβολή αν δεν έχει επιλεγεί κελί)")
@@ -726,7 +869,12 @@ class MainWindow(QMainWindow):
         self.ed_search.returnPressed.connect(self.open_first_match)
         self.lbl_found = QLabel("")
         lv.addWidget(QLabel("<b>Κάμερες</b>")); lv.addWidget(self.ed_search)
-        lv.addWidget(self.cam_list); lv.addWidget(self.lbl_found)
+        self.btn_discover = QPushButton("🔍 Εύρεση καμερών από το καταγραφικό")
+        self.btn_discover.setToolTip("Ρωτά το καταγραφικό ποιες κάμερες έχει (ονόματα, IP κάμερες,\n"
+                                     "κατάσταση) και φτιάχνει τη λίστα μόνο του. Δεν αλλάζει τίποτα\n"
+                                     "στη συσκευή. Χρησιμοποιεί τη θύρα HTTP (web).")
+        self.btn_discover.clicked.connect(self.discover)
+        lv.addWidget(self.cam_list); lv.addWidget(self.lbl_found); lv.addWidget(self.btn_discover)
         splitter.addWidget(left); splitter.addWidget(self.grid_host)
         splitter.setStretchFactor(1, 1)
 
@@ -805,6 +953,76 @@ class MainWindow(QMainWindow):
         if self.running:
             self.play_page()
         self.update_page_label()
+
+    def populate_camera_list(self):
+        self.cam_list.clear()
+        for cid, name in DEFAULT_CAMERAS:
+            off = cid in OFFLINE_IDS
+            it = QListWidgetItem(f"{cid}  {name}" + ("  ⚠ εκτός" if off else ""))
+            it.setData(Qt.UserRole, (cid, name))
+            if off:
+                it.setToolTip("Το καταγραφικό δηλώνει ότι αυτή η IP κάμερα είναι εκτός (offline).")
+            self.cam_list.addItem(it)
+
+    def discover(self):
+        cfg = self.read_cfg()
+        if not cfg["ip"] or cfg["ip"].endswith("."):
+            QMessageBox.warning(self, "IP", "Συμπλήρωσε τη διεύθυνση IP του καταγραφικού.")
+            return
+        self.btn_discover.setEnabled(False)
+        self.statusBar().showMessage(f"Ρωτάω το καταγραφικό ({cfg['ip']}:{cfg.get('http_port', 80)}) "
+                                     "ποιες κάμερες έχει...")
+        self._disc = DiscoverWorker(cfg)
+        self._disc.done.connect(self.on_discovered)
+        self._disc.start()
+
+    def on_discovered(self, res):
+        self.btn_discover.setEnabled(True)
+        # αναφορά για διάγνωση (χωρίς κωδικούς), π.χ. αν το firmware έχει άλλη μορφή
+        try:
+            with open(os.path.join(APP_DIR, "discover_debug.txt"), "w", encoding="utf-8") as f:
+                f.write("Αποτέλεσμα ανίχνευσης καμερών\n")
+                for path, st in res.get("log", []):
+                    f.write(f"  {st}  {path}\n")
+                if res.get("error"):
+                    f.write("Σφάλμα: " + res["error"] + "\n")
+                for path, txt in res.get("raw", {}).items():
+                    f.write(f"\n===== {path}\n{txt}\n")
+        except OSError:
+            pass
+        cams = res.get("cameras", [])
+        if not cams:
+            why = res.get("error") or "το καταγραφικό δεν επέστρεψε λίστα καμερών"
+            QMessageBox.warning(
+                self, "Εύρεση καμερών",
+                f"Δεν βρέθηκαν κάμερες ({why}).\n\nΈλεγξε IP, χρήστη/κωδικό και τη θύρα HTTP. "
+                "Η λίστα έμεινε όπως ήταν.\nΛεπτομέρειες στο discover_debug.txt (δίπλα στο πρόγραμμα).")
+            self.statusBar().showMessage("Η εύρεση καμερών απέτυχε.")
+            return
+        self.stop_all()
+        apply_cameras(cams)
+        self.cfg["cameras"] = [{"id": c["id"], "name": c["name"], "channel": c["channel"],
+                                "online": c.get("online")} for c in cams]
+        save_config(self.cfg)
+        self.populate_camera_list()
+        self.ed_search.clear()
+        self.page = 0
+        self.relayout(reset_page=True)
+        n_ip = sum(1 for c in cams if c["kind"] == "ip")
+        lines = []
+        for c in cams:
+            extra = ""
+            if c["kind"] == "ip":
+                extra = f"  IP {c.get('ip', '')}  " + {True: "online", False: "ΕΚΤΟΣ",
+                                                       None: ""}[c.get("online")]
+            lines.append(f"{c['id']:4} κανάλι {c['channel']:<3} {c['name']}{extra}")
+        box = QMessageBox(self)
+        box.setWindowTitle("Εύρεση καμερών")
+        box.setText(f"Βρέθηκαν {len(cams)} κάμερες ({len(cams) - n_ip} αναλογικές, {n_ip} IP) "
+                    "και μπήκαν στη λίστα. Η λίστα αποθηκεύτηκε για την επόμενη φορά.")
+        box.setDetailedText("\n".join(lines))
+        box.exec_()
+        self.statusBar().showMessage(f"Βρέθηκαν {len(cams)} κάμερες από το καταγραφικό.")
 
     @staticmethod
     def _norm(t):
