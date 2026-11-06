@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from datetime import datetime
+import urllib.request
 from urllib.parse import quote
 
 # Σίγαση μηνυμάτων ffmpeg/OpenCV στην κονσόλα
@@ -70,9 +71,10 @@ DEFAULT_CONFIG = {
     "port": 554,
     "user": "admin",
     "password": "",
-    "stream": "sub",        # sub | main
+    "stream": "sub",        # sub | main | snapshot
     "layout": 4,            # 1, 4, 9, 16
     "ip_base": 16,          # D1 = ip_base+1  (δοκίμασε 32 αν δεν παίζουν οι IP)
+    "http_port": 80,        # θύρα web, για τη λειτουργία Στιγμιότυπα HTTP
 }
 
 
@@ -106,6 +108,81 @@ def build_url(cfg, cam_id, stream):
     user = quote(cfg["user"], safe="")
     pwd = quote(cfg["password"], safe="")
     return f"rtsp://{user}:{pwd}@{cfg['ip']}:{cfg['port']}/Streaming/Channels/{ch}{st}"
+
+
+def snapshot_url(cfg, cam_id):
+    ch = channel_number(cam_id, cfg["ip_base"])
+    return f"http://{cfg['ip']}:{cfg.get('http_port', 80)}/ISAPI/Streaming/channels/{ch}01/picture"
+
+
+def make_http_opener(cfg):
+    """Digest/Basic opener για τα στιγμιότυπα ISAPI."""
+    base = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}"
+    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    mgr.add_password(None, base, cfg["user"], cfg["password"])
+    return urllib.request.build_opener(
+        urllib.request.HTTPDigestAuthHandler(mgr),
+        urllib.request.HTTPBasicAuthHandler(mgr),
+    )
+
+
+# --------------------------------------------------------------------------- #
+class HttpSnapshotWorker(QThread):
+    """Ζωντανή εικόνα χωρίς RTSP: ζητά συνεχώς στιγμιότυπο JPEG μέσω HTTP.
+    Παράκαμψη για κρυπτογραφημένη ροή RTSP - ο δρόμος του στιγμιότυπου
+    δεν κρυπτογραφείται. Μικρό ρυθμό καρέ (~1 fps), αλλά καθαρή εικόνα."""
+
+    def __init__(self, cfg, cam_id, interval=1.0):
+        super().__init__()
+        self.url = snapshot_url(cfg, cam_id)
+        self.opener = make_http_opener(cfg)
+        self.interval = interval
+        self._run = True
+        self.latest = None
+        self.seq = 0
+        self.status = "Σύνδεση..."
+        self.info = ""
+        self.loss = 0
+        self.target = (640, 360)
+
+    def stop(self):
+        self._run = False
+
+    def run(self):
+        fails = 0
+        while self._run:
+            t0 = time.time()
+            try:
+                # να στέλνεται ο κωδικός σε κάθε αίτημα (αλλιώς ψεύτικα 401)
+                for h in self.opener.handlers:
+                    if hasattr(h, "reset_retry_count"):
+                        h.reset_retry_count()
+                with self.opener.open(self.url, timeout=8) as r:
+                    data = r.read()
+                img = QImage()
+                if data[:2] == b"\xff\xd8" and img.loadFromData(data, "JPG") and not img.isNull():
+                    self.latest = img.convertToFormat(QImage.Format_RGB888)
+                    self.seq += 1
+                    self.status = ""
+                    self.info = f"JPEG {img.width()}x{img.height()}"
+                    fails = 0
+                else:
+                    fails += 1
+                    self.status = "Μη έγκυρη εικόνα"
+            except Exception as e:
+                fails += 1
+                msg = str(e)
+                if "401" in msg or "403" in msg:
+                    self.status = "Λάθος κωδικός/χρήστης"
+                elif "404" in msg:
+                    self.status = "Η κάμερα δεν δίνει στιγμιότυπο"
+                else:
+                    self.status = "Σφάλμα σύνδεσης"
+            # ρυθμός: περίμενε ό,τι μένει από το interval (ή λίγο παραπάνω σε σφάλμα)
+            wait = max(self.interval, 2.0) if fails else self.interval
+            end = time.time() + max(0.0, wait - (time.time() - t0))
+            while self._run and time.time() < end:
+                time.sleep(0.05)
 
 
 # --------------------------------------------------------------------------- #
@@ -272,11 +349,11 @@ class VideoTile(QLabel):
         self.setStyleSheet(f"background:#111;color:#bbb;border:2px solid {color};")
 
     # ---- ροή
-    def play(self, cam, url):
+    def play(self, cam, worker):
         self.stop()
         self.cam = cam
         self.show_text(self.caption() + "\nΣύνδεση...")
-        self.worker = StreamWorker(url)
+        self.worker = worker
         self.worker.target = (max(160, self.width()), max(90, self.height()))
         self.worker.start()
 
@@ -368,8 +445,15 @@ class MainWindow(QMainWindow):
         self.ed_user = QLineEdit(self.cfg["user"]); self.ed_user.setFixedWidth(90)
         self.ed_pass = QLineEdit(self.cfg["password"]); self.ed_pass.setEchoMode(QLineEdit.Password)
         self.ed_pass.setFixedWidth(110)
-        self.cb_stream = QComboBox(); self.cb_stream.addItems(["Δευτερεύουσα (sub)", "Κύρια (main)"])
-        self.cb_stream.setCurrentIndex(1 if self.cfg["stream"] == "main" else 0)
+        self.cb_stream = QComboBox()
+        self.cb_stream.addItems(["Δευτερεύουσα (sub)", "Κύρια (main)", "Στιγμιότυπα HTTP"])
+        self.cb_stream.setCurrentIndex(
+            {"sub": 0, "main": 1, "snapshot": 2}.get(self.cfg["stream"], 0))
+        self.cb_stream.setToolTip("Στιγμιότυπα HTTP: ζωντανή εικόνα ~1 fps μέσω της θύρας web,\n"
+                                  "για όταν η ροή RTSP είναι κρυπτογραφημένη.")
+        self.sp_http = QSpinBox(); self.sp_http.setRange(1, 65535)
+        self.sp_http.setValue(self.cfg.get("http_port", 80))
+        self.sp_http.setToolTip("Θύρα web (HTTP) του καταγραφικού - για τα Στιγμιότυπα HTTP.")
         self.cb_layout = QComboBox(); self.cb_layout.addItems(["1", "4", "9", "16"])
         self.cb_layout.setCurrentText(str(self.cfg["layout"]))
         self.sp_ipbase = QSpinBox(); self.sp_ipbase.setRange(0, 64); self.sp_ipbase.setValue(self.cfg["ip_base"])
@@ -388,6 +472,7 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         for lbl, w in [("IP:", self.ed_ip), ("Θύρα:", self.sp_port), ("Χρήστης:", self.ed_user),
                        ("Κωδικός:", self.ed_pass), ("Ροή:", self.cb_stream),
+                       ("HTTP:", self.sp_http),
                        ("Πλέγμα:", self.cb_layout), ("IP βάση:", self.sp_ipbase)]:
             top.addWidget(QLabel(lbl)); top.addWidget(w)
         top.addWidget(btn_connect); top.addWidget(btn_stop)
@@ -441,12 +526,19 @@ class MainWindow(QMainWindow):
             "port": self.sp_port.value(),
             "user": self.ed_user.text().strip(),
             "password": self.ed_pass.text(),
-            "stream": "main" if self.cb_stream.currentIndex() == 1 else "sub",
+            "stream": ["sub", "main", "snapshot"][self.cb_stream.currentIndex()],
             "layout": int(self.cb_layout.currentText()),
             "ip_base": self.sp_ipbase.value(),
+            "http_port": self.sp_http.value(),
         })
         save_config(self.cfg)
         return self.cfg
+
+    def make_worker(self, cfg, cam_id, stream):
+        """Φτιάχνει τον σωστό worker ανάλογα με τη λειτουργία."""
+        if stream == "snapshot":
+            return HttpSnapshotWorker(cfg, cam_id, interval=1.0)
+        return StreamWorker(build_url(cfg, cam_id, stream))
 
     # ---------- πλέγμα
     def build_tiles(self, n):
@@ -495,7 +587,7 @@ class MainWindow(QMainWindow):
         cams = DEFAULT_CAMERAS[self.page * n:(self.page + 1) * n]
         for i, t in enumerate(self.tiles):
             if i < len(cams):
-                t.play(cams[i], build_url(cfg, cams[i][0], cfg["stream"]))
+                t.play(cams[i], self.make_worker(cfg, cams[i][0], cfg["stream"]))
             else:
                 t.stop()
 
@@ -551,8 +643,13 @@ class MainWindow(QMainWindow):
         self.build_tiles(1)
         self.single_mode = (cam, prev_layout, prev_page)
         cfg = self.read_cfg()
-        # Στη μονή προβολή χρησιμοποιούμε πάντα κύρια ροή (καλύτερη ποιότητα)
-        self.tiles[0].play(cam, build_url(cfg, cam[0], "main"))
+        # Στη μονή προβολή: στιγμιότυπα αν είναι σε αυτή τη λειτουργία,
+        # αλλιώς κύρια ροή (καλύτερη ποιότητα)
+        single = "snapshot" if cfg["stream"] == "snapshot" else "main"
+        w = self.make_worker(cfg, cam[0], single)
+        if single == "snapshot":
+            w.interval = 0.5                       # πιο γρήγορα στη μονή προβολή
+        self.tiles[0].play(cam, w)
         self.running = True
         self.lbl_page.setText("Μονή")
 
@@ -564,7 +661,7 @@ class MainWindow(QMainWindow):
             return
         if self.selected_tile and not self.single_mode:
             self.running = True
-            self.selected_tile.play(cam, build_url(cfg, cam[0], cfg["stream"]))
+            self.selected_tile.play(cam, self.make_worker(cfg, cam[0], cfg["stream"]))
         else:
             self.play_single(cam)
 
@@ -581,7 +678,11 @@ class MainWindow(QMainWindow):
 
     def safe_url(self, cam_id):
         cfg = dict(self.read_cfg()); cfg["password"] = "****"
-        stream = "main" if self.single_mode else cfg["stream"]
+        stream = cfg["stream"]
+        if self.single_mode and stream != "snapshot":
+            stream = "main"
+        if stream == "snapshot":
+            return snapshot_url(cfg, cam_id)
         return build_url(cfg, cam_id, stream)
 
     def show_url(self):
