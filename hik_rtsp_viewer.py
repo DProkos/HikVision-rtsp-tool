@@ -918,7 +918,7 @@ class MainWindow(QMainWindow):
                        ("Κωδικός:", self.ed_pass), ("Ροή:", self.cb_stream),
                        ("HTTP:", self.sp_http), ("fps:", self.sp_fps),
                        ("συνδ.:", self.sp_conns), ("Ανάλ.:", self.cb_res),
-                       ("Πλέγμα:", self.cb_layout), ("IP βάση:", self.sp_ipbase)]:
+                       ("Πλέγμα:", self.cb_layout), ("Αρ.Κάμερον:", self.sp_ipbase)]:
             box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0); hb.setSpacing(3)
             hb.addWidget(QLabel(lbl)); hb.addWidget(w)
             self._field_boxes[w] = box
