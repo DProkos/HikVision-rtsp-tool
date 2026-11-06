@@ -13,10 +13,12 @@ keep-alive, και ελέγχει σωστά το digest response.
   --mjpeg   ενεργοποιεί το /httpPreview (ροή multipart)
   --delay   χρόνος «δημιουργίας» κάθε εικόνας σε δευτερόλεπτα
   --serial  ένα αίτημα τη φορά (μιμείται DVR που δεν δουλεύει παράλληλα)
+  --tls     HTTPS με αυτο-υπογεγραμμένο πιστοποιητικό (χρειάζεται: pip install cryptography)
 Χρήστης/κωδικός: admin / test
 """
 import argparse
 import hashlib
+import os
 import re
 import threading
 import time
@@ -100,18 +102,54 @@ def make_handler(jpeg, delay, mjpeg, serial=False):
     return Handler
 
 
+def make_self_signed(tmpdir):
+    """Αυτο-υπογεγραμμένο πιστοποιητικό (όπως τα πραγματικά καταγραφικά). Θέλει: pip install cryptography"""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mock-dvr")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .sign(key, hashes.SHA256()))
+    cpath, kpath = os.path.join(tmpdir, "cert.pem"), os.path.join(tmpdir, "key.pem")
+    with open(cpath, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(kpath, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM,
+                                  serialization.PrivateFormat.TraditionalOpenSSL,
+                                  serialization.NoEncryption()))
+    return cpath, kpath
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--jpeg")
     ap.add_argument("--mjpeg", action="store_true")
     ap.add_argument("--delay", type=float, default=0.02)
+    ap.add_argument("--tls", action="store_true",
+                    help="HTTPS με αυτο-υπογεγραμμένο πιστοποιητικό (νέο σε κάθε εκκίνηση)")
     ap.add_argument("--serial", action="store_true",
                     help="εξυπηρέτηση ενός αιτήματος τη φορά (όπως αργό DVR)")
     a = ap.parse_args()
     jpeg = open(a.jpeg, "rb").read() if a.jpeg else b"\xff\xd8" + b"\x00" * 20000 + b"\xff\xd9"
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(jpeg, a.delay, a.mjpeg, a.serial))
-    print(f"mock DVR στο http://127.0.0.1:{a.port}  (admin/test)  Ctrl+C για τέλος")
+    scheme = "http"
+    if a.tls:
+        import ssl
+        import tempfile
+        cpath, kpath = make_self_signed(tempfile.mkdtemp())
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cpath, kpath)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        scheme = "https"
+    print(f"mock DVR στο {scheme}://127.0.0.1:{a.port}  (admin/test)  Ctrl+C για τέλος")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

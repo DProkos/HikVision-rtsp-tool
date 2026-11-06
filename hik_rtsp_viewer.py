@@ -52,6 +52,7 @@ from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QComboBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
     QSpinBox, QSplitter, QVBoxLayout, QWidget, QSizePolicy, QShortcut, QLayout,
+    QCheckBox,
 )
 
 FROZEN = getattr(sys, "frozen", False)          # True όταν τρέχει ως exe (PyInstaller)
@@ -87,6 +88,8 @@ DEFAULT_CONFIG = {
     "layout": 4,            # 1, 4, 9, 16
     "ip_base": 16,          # D1 = ip_base+1  (δοκίμασε 32 αν δεν παίζουν οι IP)
     "http_port": 80,        # θύρα web, για τη λειτουργία Στιγμιότυπα HTTP
+    "https": False,         # HTTPS αντί για HTTP (συνήθως θύρα 443)
+    "cert_pins": {},        # αποτυπώματα πιστοποιητικών HTTPS που εμπιστευόμαστε
     "fps": 2,               # ρυθμός καρέ στη λειτουργία HTTP (στιγμιότυπα)
     "mjpeg": True,          # δοκίμασε ζωντανή ροή MJPEG (πιο real-time)
     "conns": 3,             # παράλληλες συνδέσεις ανά κάμερα (λειτουργία HTTP)
@@ -142,9 +145,15 @@ def build_url(cfg, cam_id, stream):
     return f"rtsp://{user}:{pwd}@{cfg['ip']}:{cfg['port']}/Streaming/Channels/{ch}{st}"
 
 
+def http_base(cfg):
+    """http(s)://ip:θύρα του καταγραφικού, ανάλογα με την επιλογή HTTPS."""
+    scheme = "https" if cfg.get("https") else "http"
+    return f"{scheme}://{cfg['ip']}:{cfg.get('http_port', 80)}"
+
+
 def snapshot_url(cfg, cam_id):
     ch = channel_number(cam_id, cfg["ip_base"])
-    url = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}/ISAPI/Streaming/channels/{ch}01/picture"
+    url = f"{http_base(cfg)}/ISAPI/Streaming/channels/{ch}01/picture"
     res = cfg.get("snap_res", "full")
     if res and res != "full":                 # π.χ. "352x288": πιο γρήγορη εικόνα από το DVR
         w, h = res.split("x")
@@ -155,7 +164,7 @@ def snapshot_url(cfg, cam_id):
 def mjpeg_urls(cfg, cam_id):
     """Πιθανές διευθύνσεις ζωντανής ροής MJPEG (διαφέρουν ανά firmware)."""
     ch = channel_number(cam_id, cfg["ip_base"])
-    host = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}"
+    host = http_base(cfg)
     return [
         f"{host}/ISAPI/Streaming/channels/{ch}02/httpPreview",
         f"{host}/ISAPI/Streaming/channels/{ch}01/httpPreview",
@@ -164,18 +173,44 @@ def mjpeg_urls(cfg, cam_id):
 
 def make_http_opener(cfg):
     """Digest/Basic opener για τα στιγμιότυπα ISAPI."""
-    base = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}"
+    base = http_base(cfg)
     mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     mgr.add_password(None, base, cfg["user"], cfg["password"])
-    return urllib.request.build_opener(
-        urllib.request.HTTPDigestAuthHandler(mgr),
-        urllib.request.HTTPBasicAuthHandler(mgr),
-    )
+    handlers = [urllib.request.HTTPDigestAuthHandler(mgr),
+                urllib.request.HTTPBasicAuthHandler(mgr)]
+    if cfg.get("https"):
+        handlers.append(urllib.request.HTTPSHandler(context=_tls_context()))
+    return urllib.request.build_opener(*handlers)
 
 
 import hashlib        # noqa: E402
 import http.client    # noqa: E402
+import ssl            # noqa: E402
 from urllib.parse import urlsplit  # noqa: E402
+
+# Πιστοποιητικά HTTPS που έχουμε «μάθει» ("ip:θύρα" -> αποτύπωμα sha256). Τα καταγραφικά
+# έχουν αυτο-υπογεγραμμένο πιστοποιητικό, άρα δεν μπορούμε να το ελέγξουμε από αρχή.
+# Εμπιστευόμαστε το πρώτο που βλέπουμε (TOFU) και αν αλλάξει αργότερα, σταματάμε.
+CERT_PINS = {}
+
+
+class CertChangedError(OSError):
+    """Το πιστοποιητικό του καταγραφικού διαφέρει από αυτό που είχαμε αποθηκεύσει."""
+
+
+def _tls_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE                 # ο έλεγχος γίνεται με το αποτύπωμα (pin)
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1   # παλιά firmware δεν έχουν TLS 1.2
+    except (AttributeError, ValueError):
+        pass
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")       # παλιά πιστοποιητικά (RSA 1024, SHA1)
+    except ssl.SSLError:
+        pass
+    return ctx
 
 
 class FastHttpClient:
@@ -185,7 +220,8 @@ class FastHttpClient:
 
     def __init__(self, url, user, password, timeout=5):
         p = urlsplit(url)
-        self.host, self.port = p.hostname, p.port or 80
+        self.https = p.scheme == "https"
+        self.host, self.port = p.hostname, p.port or (443 if self.https else 80)
         self.path = p.path + (("?" + p.query) if p.query else "")
         self.user, self.password, self.timeout = user, password, timeout
         self.conn = None
@@ -195,7 +231,30 @@ class FastHttpClient:
 
     def _connect(self):
         self.close()
-        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        if not self.https:
+            self.conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+            return
+        conn = http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout,
+                                           context=_tls_context())
+        conn.connect()
+        try:
+            self._check_pin(conn)
+        except Exception:
+            conn.close()
+            raise
+        self.conn = conn
+
+    def _check_pin(self, conn):
+        der = conn.sock.getpeercert(binary_form=True)
+        fp = hashlib.sha256(der).hexdigest()
+        key = f"{self.host}:{self.port}"
+        known = CERT_PINS.get(key)
+        if known is None:
+            CERT_PINS[key] = fp                       # πρώτη φορά: το εμπιστευόμαστε
+        elif known != fp:
+            raise CertChangedError(
+                f"ΑΛΛΑΞΕ το πιστοποιητικό HTTPS του {key}. Αν το άλλαξες εσύ (π.χ. νέο firmware), "
+                "πάτα «Επαναφορά πιστοποιητικού». Αλλιώς μπορεί να μην είναι το δικό σου καταγραφικό!")
 
     def close(self):
         if self.conn:
@@ -262,15 +321,19 @@ def _strip_ns(xml):
 
 
 def _isapi_get(cfg, path, timeout=6):
-    """(status, κείμενο). Δεν σηκώνει εξαίρεση για HTTP σφάλματα."""
-    url = f"http://{cfg['ip']}:{cfg.get('http_port', 80)}{path}"
+    """(status, κείμενο). Δεν σηκώνει εξαίρεση για HTTP σφάλματα (εκτός από αλλαγή πιστοποιητικού)."""
+    url = f"{http_base(cfg)}{path}"
     c = FastHttpClient(url, cfg["user"], cfg["password"], timeout=timeout)
     try:
         return 200, c.get().decode("utf-8", "replace")
+    except CertChangedError:
+        raise
     except OSError as e:
         m = re.search(r"HTTP (\d+)", str(e))
+        _isapi_get.last_error = str(e)
         return (int(m.group(1)) if m else 0), ""
-    except Exception:
+    except Exception as e:
+        _isapi_get.last_error = str(e)
         return 0, ""
     finally:
         c.close()
@@ -362,7 +425,10 @@ def discover_cameras(cfg):
         cams.append({"id": f"D{cid}", "name": name or f"IPCamera {cid:02d}",
                      "channel": ch, "kind": "ip", "ip": ipaddr,
                      "online": online.get(cid)})
-    return {"cameras": cams, "analog_count": analog_count, "log": log, "raw": raw}
+    res = {"cameras": cams, "analog_count": analog_count, "log": log, "raw": raw}
+    if not cams and getattr(_isapi_get, "last_error", ""):
+        res["error"] = _isapi_get.last_error       # π.χ. σφάλμα HTTPS/σύνδεσης
+    return res
 
 
 class DiscoverWorker(QThread):
@@ -521,7 +587,11 @@ class HttpSnapshotWorker(QThread):
             except Exception as e:
                 fails += 1
                 msg = str(e)
-                if "401" in msg or "403" in msg:
+                if isinstance(e, CertChangedError):
+                    self.status = "⚠ ΑΛΛΑΞΕ το πιστοποιητικό HTTPS"
+                elif isinstance(e, ssl.SSLError):
+                    self.status = "Σφάλμα HTTPS (είναι ενεργό το HTTPS στο καταγραφικό;)"
+                elif "401" in msg or "403" in msg:
                     self.status = "Λάθος κωδικός/χρήστης"
                 elif "404" in msg:
                     self.status = "Η κάμερα δεν δίνει στιγμιότυπο"
@@ -859,6 +929,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Hik RTSP Viewer - DS-7216HUHI-K2")
         self.resize(1400, 820)
         self.cfg = load_config()
+        CERT_PINS.update(self.cfg.get("cert_pins") or {})
         if self.cfg.get("cameras"):                 # λίστα από προηγούμενη ανίχνευση
             try:
                 apply_cameras(self.cfg["cameras"])
@@ -884,6 +955,17 @@ class MainWindow(QMainWindow):
         self.sp_http = QSpinBox(); self.sp_http.setRange(1, 65535)
         self.sp_http.setValue(self.cfg.get("http_port", 80))
         self.sp_http.setToolTip("Θύρα web (HTTP) του καταγραφικού - για τα Στιγμιότυπα HTTP.")
+        self.chk_https = QCheckBox()
+        self.chk_https.setChecked(bool(self.cfg.get("https", False)))
+        self.chk_https.setToolTip("Κρυπτογραφημένη σύνδεση (HTTPS) με το καταγραφικό, συνήθως θύρα 443.\n"
+                                  "Πρέπει να είναι ενεργό στο καταγραφικό (Δίκτυο → Προηγμένες → HTTPS).\n"
+                                  "Το πιστοποιητικό απομνημονεύεται στην πρώτη σύνδεση· αν αλλάξει,\n"
+                                  "το πρόγραμμα σταματά και σε προειδοποιεί.")
+        self.btn_pin = QPushButton("🔓 Επαναφορά πιστοποιητικού")
+        self.btn_pin.setToolTip("Ξεχνά το αποθηκευμένο πιστοποιητικό HTTPS αυτού του καταγραφικού.\n"
+                                "Χρησιμοποίησέ το μόνο αν άλλαξες εσύ το πιστοποιητικό ή το firmware.")
+        self.btn_pin.clicked.connect(self.reset_pin)
+        self.chk_https.toggled.connect(self.on_https_toggled)
         self.sp_conns = QSpinBox(); self.sp_conns.setRange(1, 8)
         self.sp_conns.setValue(self.cfg.get("conns", 3))
         self.sp_conns.setToolTip("Παράλληλες συνδέσεις ανά κάμερα (λειτουργία HTTP).\n"
@@ -926,7 +1008,8 @@ class MainWindow(QMainWindow):
         self._field_boxes = {}               # πεδίο -> κουτί (ετικέτα+πεδίο) για απόκρυψη/εμφάνιση
         for lbl, w in [("IP:", self.ed_ip), ("RTSP:", self.sp_port), ("Χρήστης:", self.ed_user),
                        ("Κωδικός:", self.ed_pass), ("Ροή:", self.cb_stream),
-                       ("HTTP:", self.sp_http), ("fps:", self.sp_fps),
+                       ("HTTP:", self.sp_http), ("HTTPS:", self.chk_https), ("", self.btn_pin),
+                       ("fps:", self.sp_fps),
                        ("συνδ.:", self.sp_conns), ("Ανάλ.:", self.cb_res),
                        ("Πλέγμα:", self.cb_layout), ("Αρ.Κάμερον:", self.sp_ipbase)]:
             box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0); hb.setSpacing(3)
@@ -1002,13 +1085,14 @@ class MainWindow(QMainWindow):
         self.cb_layout.currentTextChanged.connect(lambda _: self.relayout(reset_page=True))
         self.cb_stream.currentIndexChanged.connect(lambda _: self.restart_if_running())
         self.cb_stream.currentIndexChanged.connect(lambda _: self.apply_mode_fields())
+        self.chk_https.toggled.connect(lambda _: self.apply_mode_fields())
         self.apply_mode_fields()
         self.running = False
         self.build_tiles(self.layout_n())
 
         # Ανανέωση οθόνης ~12 fps από το τελευταίο καρέ κάθε κάμερας
         self.timer = QTimer(self)
-        self.timer.timeout.connect(lambda: [t.poll() for t in self.tiles])
+        self.timer.timeout.connect(self.on_tick)
         self.timer.start(80)
 
     # ---------- ρυθμίσεις
@@ -1022,6 +1106,8 @@ class MainWindow(QMainWindow):
             "layout": self.layout_n(),
             "ip_base": self.sp_ipbase.value(),
             "http_port": self.sp_http.value(),
+            "https": self.chk_https.isChecked(),
+            "cert_pins": dict(CERT_PINS),
             "fps": self.sp_fps.value(),
             "mjpeg": self.cfg.get("mjpeg", True),
             "conns": self.sp_conns.value(),
@@ -1035,7 +1121,7 @@ class MainWindow(QMainWindow):
         if stream == "snapshot":
             return HttpSnapshotWorker(cfg, cam_id,
                                       fps=fps if fps else cfg.get("fps", 2),
-                                      want_mjpeg=cfg.get("mjpeg", True),
+                                      want_mjpeg=cfg.get("mjpeg", True) and not cfg.get("https"),
                                       conns=conns if conns else 1)
         return StreamWorker(build_url(cfg, cam_id, stream))
 
@@ -1068,6 +1154,13 @@ class MainWindow(QMainWindow):
         if self.running:
             self.play_page()
         self.update_page_label()
+
+    def on_tick(self):
+        for t in self.tiles:
+            t.poll()
+        # νέο πιστοποιητικό HTTPS που μάθαμε -> αποθήκευση αμέσως (όχι μόνο στο κλείσιμο)
+        if CERT_PINS != (self.cfg.get("cert_pins") or {}):
+            self.read_cfg()
 
     def toggle_fullscreen(self):
         """F11: το παράθυρο γεμίζει την οθόνη. Όλα τα στοιχεία μένουν και προσαρμόζονται."""
@@ -1119,6 +1212,31 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._scale_timer.start(120)            # μετά το τέλος του resize, όχι σε κάθε pixel
+
+    def on_https_toggled(self, checked):
+        """80 <-> 443 αυτόματα, αν η θύρα είναι ακόμη η προεπιλεγμένη."""
+        if checked and self.sp_http.value() == 80:
+            self.sp_http.setValue(443)
+        elif not checked and self.sp_http.value() == 443:
+            self.sp_http.setValue(80)
+        self.restart_if_running()
+
+    def reset_pin(self):
+        key = f"{self.ed_ip.text().strip()}:{self.sp_http.value()}"
+        if key not in CERT_PINS:
+            QMessageBox.information(self, "Πιστοποιητικό",
+                                    f"Δεν υπάρχει αποθηκευμένο πιστοποιητικό για το {key}.")
+            return
+        r = QMessageBox.question(
+            self, "Επαναφορά πιστοποιητικού",
+            f"Να ξεχαστεί το αποθηκευμένο πιστοποιητικό του {key};\n\n"
+            "Στην επόμενη σύνδεση θα εμπιστευτεί αυτό που θα δει.\n"
+            "Κάν' το μόνο αν άλλαξες εσύ το πιστοποιητικό ή το firmware του καταγραφικού.")
+        if r == QMessageBox.Yes:
+            CERT_PINS.pop(key, None)
+            self.read_cfg()
+            self.statusBar().showMessage("Το πιστοποιητικό ξεχάστηκε.")
+            self.restart_if_running()
 
     def populate_camera_list(self):
         self.cam_list.clear()
@@ -1237,9 +1355,10 @@ class MainWindow(QMainWindow):
         """Δείχνει μόνο τα πεδία που αφορούν την επιλεγμένη ροή:
         RTSP (sub/main): θύρα RTSP.  Στιγμιότυπα HTTP: θύρα HTTP, fps, συνδ., ανάλυση."""
         http = self.cb_stream.currentIndex() == 2
-        http_only = (self.sp_http, self.sp_fps, self.sp_conns, self.cb_res)
+        http_only = (self.sp_http, self.chk_https, self.sp_fps, self.sp_conns, self.cb_res)
         for w in http_only:
             self._field_boxes[w].setVisible(http)
+        self._field_boxes[self.btn_pin].setVisible(http and self.chk_https.isChecked())
         self._field_boxes[self.sp_port].setVisible(not http)
         self.top_bar.updateGeometry()
         self.statusBar().showMessage(
