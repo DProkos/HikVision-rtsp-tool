@@ -180,6 +180,36 @@ class HikHttpCamera:
             c.close()
         return None, None
 
+    def probe(self):
+        """Ελέγχει τι απαντά το καταγραφικό σε κάθε endpoint εικόνας.
+        Επιστρέφει λίστα από dict: {url, status, content_type, jpeg, note}."""
+        report = []
+        for url in self.mjpeg_urls() + [self.picture_url()]:
+            row = {"url": url, "status": None, "content_type": "", "jpeg": False, "note": ""}
+            c = DigestKeepAliveClient(url, self.user, self.password, self.timeout)
+            try:
+                r, _ = c.open(stream=True)
+                row["status"] = r.status
+                row["content_type"] = (r.getheader("Content-Type") or "").split(";")[0]
+                if r.status == 200:
+                    if "multipart" in (r.getheader("Content-Type") or "").lower():
+                        # διάβασε λίγο για να δεις αν έρχονται JPEG
+                        chunk = r.read(65536)
+                        row["jpeg"] = b"\xff\xd8" in chunk
+                        row["note"] = "ροή MJPEG" if row["jpeg"] else "multipart χωρίς JPEG (ίσως H.264)"
+                    else:
+                        body = r.read(65536)
+                        row["jpeg"] = body[:2] == b"\xff\xd8"
+                        row["note"] = "ένα JPEG" if row["jpeg"] else "όχι JPEG"
+                else:
+                    row["note"] = "δεν υποστηρίζεται" if r.status == 404 else f"HTTP {r.status}"
+            except Exception as e:
+                row["note"] = f"σφάλμα: {str(e)[:50]}"
+            finally:
+                c.close()
+            report.append(row)
+        return report
+
     def frames(self, fps=15.0, try_mjpeg=True):
         """Γεννήτρια με bytes JPEG. Τρέχει μέχρι να τη σταματήσεις (break)."""
         if try_mjpeg:
@@ -217,10 +247,19 @@ def main():
     ap.add_argument("--fps", type=float, default=15)
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--no-mjpeg", action="store_true", help="μόνο polling στιγμιοτύπων")
+    ap.add_argument("--probe", action="store_true",
+                    help="μόνο έλεγχος: τι υποστηρίζει το καταγραφικό (χωρίς μέτρηση)")
     ap.add_argument("--save", help="αποθήκευση του τελευταίου καρέ σε αρχείο")
     a = ap.parse_args()
 
     cam = HikHttpCamera(a.ip, a.user, a.password, a.channel, a.port)
+    if a.probe:
+        print(f"Έλεγχος endpoints εικόνας (κανάλι {a.channel}):")
+        for row in cam.probe():
+            tail = row["url"].split("/channels/")[-1]
+            print(f"  {str(row['status']):>4}  {row['content_type']:<28} "
+                  f"{tail:<22} {row['note']}")
+        return
     n, size, last, t0 = 0, 0, None, time.time()
     for jpeg in cam.frames(fps=a.fps, try_mjpeg=not a.no_mjpeg):
         n += 1
